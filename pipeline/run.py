@@ -46,22 +46,43 @@ def clean_symbols(symbols) -> list[str]:
     return out
 
 
-def load_nifty500_symbols() -> list[str]:
+LISTING_COLUMNS = {"Company Name": "name", "Industry": "industry", "Series": "series"}
+
+
+def parse_nifty500_listing(csv_text: str) -> tuple[list[str], dict]:
+    """(["SYM.NS", ...], {"SYM.NS": {"name", "industry", "series"}}) from NSE's NIFTY 500 CSV.
+
+    Older fallback files have only a Symbol column; the listing is then empty."""
+    df = pd.read_csv(io.StringIO(csv_text), dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    symbols, listing = [], {}
+    for row in df.to_dict(orient="records"):
+        kept = clean_symbols([row.get("Symbol")])
+        if not kept:
+            continue
+        sym = f"{kept[0]}.NS"
+        symbols.append(sym)
+        meta = {key: str(row[col]).strip() for col, key in LISTING_COLUMNS.items()
+                if col in row and pd.notna(row[col])}
+        if meta:
+            listing[sym] = meta
+    return symbols, listing
+
+
+def load_nifty500_symbols() -> tuple[list[str], dict]:
     """Live NIFTY 500 list from NSE; falls back to data/nifty500_symbols.csv (refreshed on each success)."""
     try:
         resp = requests.get(NIFTY500_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        symbols = clean_symbols(df["Symbol"].dropna())
+        symbols, listing = parse_nifty500_listing(resp.text)
         if len(symbols) >= 100:
             FALLBACK_SYMBOLS.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame({"Symbol": symbols}).to_csv(FALLBACK_SYMBOLS, index=False)
-            return [f"{s}.NS" for s in symbols]
+            FALLBACK_SYMBOLS.write_text(resp.text)
+            return symbols, listing
     except Exception as exc:
         print(f"NSE list unavailable ({exc}); using {FALLBACK_SYMBOLS}", file=sys.stderr)
     if FALLBACK_SYMBOLS.exists():
-        df = pd.read_csv(FALLBACK_SYMBOLS)
-        return [f"{s}.NS" for s in clean_symbols(df["Symbol"].dropna())]
+        return parse_nifty500_listing(FALLBACK_SYMBOLS.read_text())
     raise FileNotFoundError("Could not fetch the NIFTY 500 list and no fallback CSV exists.")
 
 
@@ -177,7 +198,7 @@ def legacy_row(record: dict, bundle: dict) -> dict:
 
 
 def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, betas: dict | None = None,
-             dividends: dict | None = None):
+             dividends: dict | None = None, listing: dict | None = None):
     res = fetch_bundle(symbol, dividends=(dividends or {}).get(symbol))
     if res.bundle is None:
         return None, {"symbol": symbol, "error": res.error}
@@ -189,7 +210,7 @@ def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, b
         fin_ccy, quote_ccy = statements_currency(bundle["info"])
         official = (closes or {}).get(symbol.replace(".NS", ""))
         rec = build_record(symbol, bundle, macro, as_of=as_of, official_price=official,
-                           fx_rate=fx_rate(fin_ccy, quote_ccy))
+                           fx_rate=fx_rate(fin_ccy, quote_ccy), listing=(listing or {}).get(symbol))
         return (rec, legacy_row(rec, bundle)), None
     except Exception as exc:  # one bad ticker never stops the run
         return None, {"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
@@ -266,7 +287,7 @@ def retry_failures(failures: list[dict], process, cooldown: int = RETRY_COOLDOWN
 def main() -> int:
     macro, rf_source = live_macro(load_macro())
     print(f"Risk-free rate {macro['rf']:.4%} from {rf_source}")
-    symbols = load_nifty500_symbols()
+    symbols, listing = load_nifty500_symbols()
     limit = int(os.environ.get("MAX_STOCKS", "0"))
     targets = symbols[:limit] if limit > 0 else symbols
     now = datetime.now(timezone.utc)
@@ -278,7 +299,8 @@ def main() -> int:
     print(f"Prices: {price_source}. Betas vs NIFTY 50 for {len(betas)}/{len(targets)}. "
           f"Valuing {len(targets)} NIFTY 500 stocks...")
 
-    process = partial(_process, macro=macro, as_of=as_of, closes=closes, betas=betas, dividends=dividends)
+    process = partial(_process, macro=macro, as_of=as_of, closes=closes, betas=betas, dividends=dividends,
+                      listing=listing)
     records, legacy, failures, aborted = run_all(targets, process)
     if aborted:
         print(f"Stopped after {MAX_CONSECUTIVE_FAILURES} failures in a row (data source blocking?); "

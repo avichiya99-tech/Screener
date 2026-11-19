@@ -12,7 +12,7 @@ import pandas as pd
 import requests
 
 BHAV_URL = "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{d}_F_0000.csv.zip"
-EQUITY_SERIES = {"EQ", "BE", "BZ", "SM", "ST"}
+EQUITY_SERIES = {"EQ", "BE", "BZ", "SM", "ST", "RR", "IV"}  # RR = REIT units, IV = InvIT units
 MAX_LOOKBACK_DAYS = 7  # weekends + market holidays
 
 

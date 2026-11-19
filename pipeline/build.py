@@ -38,6 +38,10 @@ def _r(x, n=2):
     return None if x is None else round(float(x), n)
 
 
+# NSE series for REITs (RR) and InvITs (IV): trusts that pass rental/toll cash through as distributions.
+# A company FCFF model does not fit them; they are valued on distribution yield and NAV.
+TRUST_SERIES = {"RR": "REIT", "IV": "InvIT"}
+
 PRICE_TOLERANCE = 0.03       # Yahoo vs NSE official close
 MCAP_TOLERANCE = 0.25        # price x shares vs reported market cap
 STALE_RESULTS_DAYS = 548     # ~18 months
@@ -70,7 +74,10 @@ def statements_currency(info: dict) -> tuple[str, str]:
 
 
 def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = None,
-                 official_price: dict | None = None, fx_rate: float | None = None) -> dict:
+                 official_price: dict | None = None, fx_rate: float | None = None,
+                 listing: dict | None = None) -> dict:
+    """`listing` is the stock's row from NSE's NIFTY 500 file: {"name", "industry", "series"}."""
+    listing = listing or {}
     info = bundle.get("info") or {}
     yahoo_price = info.get("currentPrice") or info.get("regularMarketPrice")
     if not yahoo_price or yahoo_price <= 0:
@@ -101,6 +108,10 @@ def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = Non
     reason = val.get("not_meaningful_reason") if valid else val.get("reason")
     if meaningful and sc.get("unstable_reason"):
         meaningful, reason = False, sc["unstable_reason"]
+    trust = TRUST_SERIES.get(listing.get("series"))
+    if valid and trust:
+        meaningful = False
+        reason = f"{trust}: valued on distribution yield and NAV, not a company cash-flow model"
     rated = valid and meaningful  # only rated stocks publish fair values
 
     implied = {"value": None, "status": "invalid"}
@@ -116,8 +127,8 @@ def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = Non
 
     return {
         "symbol": symbol.replace(".NS", "").replace(".BO", ""),
-        "name": info.get("shortName") or symbol,
-        "sector": info.get("sector") or "Unknown",
+        "name": listing.get("name") or info.get("shortName") or symbol,
+        "sector": info.get("sector") or listing.get("industry") or "Unknown",
         "model": val.get("model", "N/A"),
         "price": _r(price),
         "market_cap_cr": _r(mcap / 1e7, 0) if mcap else None,
