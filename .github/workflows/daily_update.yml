@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+# A manual run and the scheduled run never overlap (they would collide at git push).
+concurrency:
+  group: daily-update
+  cancel-in-progress: false
+
 jobs:
   update-screener:
     runs-on: ubuntu-latest

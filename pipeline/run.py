@@ -10,7 +10,8 @@ import os
 import shutil
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,10 +54,21 @@ def _dump(path: Path, obj) -> None:
     path.write_text(json.dumps(to_jsonable(obj), ensure_ascii=False, allow_nan=False, separators=(",", ":")))
 
 
+def recover_interrupted_swap(out_dir: Path) -> None:
+    """If a previous run crashed mid-swap, put the last good stocks/ back in place."""
+    old, cur = Path(out_dir) / ".stocks-old", Path(out_dir) / "stocks"
+    if old.exists():
+        if cur.exists():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            os.replace(old, cur)
+
+
 def write_outputs(records: list[dict], failures: list[dict], out_dir: Path, now: datetime,
                   min_success: float = 0.6, macro: dict | None = None, sources: dict | None = None) -> bool:
     """Write summary/stocks/meta/history. Writes nothing and returns False if too few tickers succeeded."""
     out_dir = Path(out_dir)
+    recover_interrupted_swap(out_dir)
     total = len(records) + len(failures)
     if total == 0 or len(records) / total < min_success:
         return False
@@ -157,6 +169,49 @@ def _process(symbol: str, macro: dict, as_of: str):
         return None, {"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
 
 
+MAX_CONSECUTIVE_FAILURES = 25  # Yahoo is blocking us: stop instead of grinding through retries
+
+
+def run_all(targets: list[str], process, workers: int = 4,
+            max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES):
+    """Run `process(symbol) -> (ok, fail)` over targets. Returns (records, legacy, failures, aborted).
+
+    Aborts early (cancelling queued work) after `max_consecutive_failures` failures in a row.
+    """
+    stop = threading.Event()
+    lock = threading.Lock()
+    streak = [0]
+    skipped = object()
+
+    def guarded(sym):
+        # The streak is tracked where the work happens, so workers stop picking up
+        # new tickers as soon as the limit is hit (not when the main thread catches up).
+        if stop.is_set():
+            return skipped
+        try:
+            ok, fail = process(sym)
+        except Exception as exc:
+            ok, fail = None, {"symbol": sym, "error": f"{type(exc).__name__}: {exc}"}
+        with lock:
+            streak[0] = streak[0] + 1 if fail else 0
+            if streak[0] >= max_consecutive_failures:
+                stop.set()
+        return ok, fail
+
+    records, legacy, failures = [], [], []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for res in ex.map(guarded, targets):
+            if res is skipped:
+                continue
+            ok, fail = res
+            if ok:
+                records.append(ok[0])
+                legacy.append(ok[1])
+            if fail:
+                failures.append(fail)
+    return records, legacy, failures, stop.is_set()
+
+
 def main() -> int:
     macro = load_macro()
     symbols = load_nifty500_symbols()
@@ -166,19 +221,11 @@ def main() -> int:
     as_of = now.astimezone(IST).date().isoformat()
     print(f"Valuing {len(targets)} NIFTY 500 stocks...")
 
-    records, legacy, failures = [], [], []
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_process, s, macro, as_of): s for s in targets}
-        for fut in as_completed(futures):
-            try:
-                ok, fail = fut.result()
-            except Exception as exc:
-                ok, fail = None, {"symbol": futures[fut], "error": f"{type(exc).__name__}: {exc}"}
-            if ok:
-                records.append(ok[0])
-                legacy.append(ok[1])
-            if fail:
-                failures.append(fail)
+    records, legacy, failures, aborted = run_all(targets, lambda s: _process(s, macro, as_of))
+    if aborted:
+        print(f"Stopped after {MAX_CONSECUTIVE_FAILURES} failures in a row (data source blocking?); "
+              f"kept previous data. Last error: {failures[-1]['error']}", file=sys.stderr)
+        return 1
 
     failures.sort(key=lambda f: f["symbol"])
     sources = {"prices": SOURCE_NAME, "statements": SOURCE_NAME, "universe": "NSE NIFTY 500 list",

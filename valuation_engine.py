@@ -339,7 +339,10 @@ def compute_valuation(
 
         dps = info.get("dividendRate") or 0.0
         t_eps = info.get("trailingEps") or (bvps * hist_roe)
-        raw_payout = (dps / t_eps) if (t_eps and t_eps > 0 and dps > 0) else None
+        if dps <= 0 and "dividendRate" in info:
+            raw_payout = 0.0  # a reported zero dividend is real data, not a missing value
+        else:
+            raw_payout = (dps / t_eps) if (t_eps and t_eps > 0 and dps > 0) else None
         payout, payout_status = _bounded(raw_payout, 0.0, 0.70, 0.15)
         inputs.set("payout", payout, payout_status)
 
@@ -602,6 +605,40 @@ def confidence(inputs: dict, meaningful: bool) -> str:
     if defaults == 1 or estimated >= 2:
         return "Medium"
     return "High"
+
+
+def simulate_values(val: dict, terminal_g: float, n: int = 5000, seed: int = 42, noise: float = 1.0) -> np.ndarray:
+    """Monte Carlo of per-share value using the same model as compute_valuation.
+
+    Randomises the driver, margin (non-financials) and discount rate around `val`'s base values.
+    noise=0 reproduces val["intrinsic_price"] exactly.
+    """
+    rng = np.random.default_rng(seed)
+    disc = np.maximum(rng.normal(val["discount_rate"], 0.01 * noise, n), terminal_g + 0.01)
+    if val["is_financial"]:
+        roe = np.clip(rng.normal(val["driver"], 0.02 * noise, n), 0.04, 0.35) if noise else np.full(n, val["driver"])
+        bv = np.full(n, val["bvps"], dtype=float)
+        pv_er = np.zeros(n)
+        for yr in range(1, 6):
+            pv_er += bv * (roe - disc) / ((1 + disc) ** yr)
+            bv = bv + bv * roe * (1 - val["payout_ratio_model"])
+        tv = bv * (roe - disc) / (1 + disc - ER_PERSISTENCE)
+        return val["bvps"] + pv_er + tv / ((1 + disc) ** 5)
+
+    g0 = rng.normal(val["driver"], 0.03 * noise, n)
+    margin = np.clip(rng.normal(val["ebit_margin"], 0.02 * noise, n), 0.01, 0.65) if noise else np.full(n, val["ebit_margin"])
+    crev = np.full(n, val["base_revenue"], dtype=float)
+    pv_tot = np.zeros(n)
+    for yr in range(1, EXPLICIT_YEARS + 1):
+        g_yr = g0 if yr <= 5 else g0 + (terminal_g - g0) * (yr - 5) / (EXPLICIT_YEARS - 5)
+        prev = crev
+        crev = prev * (1 + g_yr)
+        fcff = (crev * margin * (1 - val["tax_rate"]) + crev * (val["da_pct"] - val["capex_pct"])
+                - (crev - prev) * val["nwc_pct"])
+        pv_tot += fcff / ((1 + disc) ** yr)
+    tv = fcff * (1 + terminal_g) / (disc - terminal_g)
+    ev = pv_tot + tv / ((1 + disc) ** EXPLICIT_YEARS)
+    return (ev - val["total_debt"] + val["cash"]) / val["shares"]
 
 
 REVERSE_LOW, REVERSE_HIGH, REVERSE_STEP = -0.25, 0.70, 0.05

@@ -11,6 +11,7 @@ from valuation_engine import (
     compute_dividend_quality,
     build_historical_eps_div_df,
     export_formula_excel,
+    simulate_values,
 )
 
 st.set_page_config(page_title="India Valuation & Dividend Workbench", layout="wide")
@@ -198,7 +199,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 with tab1:
     unit_note = "(Per-Share Excess Return)" if val["is_financial"] else f"({curr} {'Crores' if val['currency']=='INR' else 'Millions'})"
-    st.markdown(f"**5-Year Forecast {unit_note}**")
+    st.markdown(f"**{len(proj)}-Year Forecast {unit_note}**")
     st.dataframe(proj, use_container_width=True, hide_index=True)
 
     w52_lo, w52_hi = bundle["info"].get("fiftyTwoWeekLow"), bundle["info"].get("fiftyTwoWeekHigh")
@@ -251,30 +252,8 @@ with tab2:
     st.plotly_chart(fig_s, use_container_width=True)
 
 with tab3:
-    rng = np.random.default_rng(42)
-    n = 5000
-    if val["is_financial"]:
-        roes = np.clip(rng.normal(val["driver"], 0.02, n), 0.04, 0.35)
-        kes = np.maximum(rng.normal(val["discount_rate"], 0.01, n), term_g + 0.01)
-        bv = np.full(n, val["bvps"], dtype=float)
-        pv_er = np.zeros(n)
-        for yr in range(1, 6):
-            er = bv * (roes - kes)
-            pv_er += er / ((1 + kes) ** yr)
-            bv = bv + (bv * roes) * (1 - val["payout_ratio_model"])
-        tv_er = (bv * 0.75 * (roes - kes)) / (kes - term_g)
-        sims = val["bvps"] + pv_er + tv_er / ((1 + kes) ** 5)
-    else:
-        rg = rng.normal(val["driver"], 0.03, n)
-        em = np.clip(rng.normal(val["ebit_margin"], 0.02, n), 0.01, 0.65)
-        wa = np.maximum(rng.normal(val["discount_rate"], 0.01, n), term_g + 0.01)
-        pv_tot, crev = np.zeros(n), np.full(n, val["base_revenue"], dtype=float)
-        for yr in range(1, 6):
-            prev = crev
-            crev = prev * (1 + rg)
-            fcff = crev * em * (1 - val["tax_rate"]) + crev * (val["da_pct"] - val["capex_pct"]) - (crev - prev) * val["nwc_pct"]
-            pv_tot += fcff / ((1 + wa) ** yr)
-        sims = (pv_tot + ((fcff * (1 + term_g)) / (wa - term_g)) / ((1 + wa) ** 5) - (val["total_debt"] - val["cash"])) / val["shares"]
+    # Same model as the headline value (10-year fade DCF / bank persistence fade).
+    sims = simulate_values(val, terminal_g=term_g, n=5000, seed=42)
 
     lo, hi = np.percentile(sims, [1, 99])
     sims = sims[(sims >= lo) & (sims <= hi)]
