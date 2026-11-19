@@ -484,6 +484,8 @@ def compute_valuation(
     intrinsic = eq_val / shares
     upside = ((intrinsic - price) / price) * 100
     mos_buy = intrinsic * (1 - mos_pct)
+    if intrinsic <= 0 and not_meaningful_reason is None:
+        not_meaningful_reason = "Model value is negative: debt exceeds projected cash flows"
 
     return {
         "valid": True,

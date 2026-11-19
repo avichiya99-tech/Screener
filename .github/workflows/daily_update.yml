@@ -13,7 +13,7 @@ jobs:
   update-screener:
     runs-on: ubuntu-latest
     env:
-      MAX_STOCKS: "200" # Change to "0" to scan all 500 NIFTY 500 stocks (~4 mins)
+      MAX_STOCKS: "0" # 0 = all NIFTY 500 stocks
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,7 +24,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
 
       - name: Run daily valuation pipeline
         run: python update_data.py
@@ -33,6 +36,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/daily_screener.csv
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily NIFTY screener $(date +'%Y-%m-%d')"
+          git add data/
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily NIFTY valuations $(date +'%Y-%m-%d')"
           git push

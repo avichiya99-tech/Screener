@@ -33,6 +33,17 @@ def test_verdict_bands():
     assert verdict(70.0, {"bear": None, "base": 100.0, "bull": 130.0}, True) == "Not rated"
 
 
+def test_negative_model_value_not_rated_and_low():
+    # Debt far above what the cash flows can support -> negative equity value per share.
+    r = compute_valuation(make_bundle(debt=50000.0))
+    assert r["intrinsic_price"] < 0
+    assert r["meaningful"] is False
+    assert "negative" in r["not_meaningful_reason"].lower()
+    assert confidence(r["inputs"], r["meaningful"]) == "Low"
+    s = compute_scenarios(make_bundle(debt=50000.0), MACRO)
+    assert verdict(100.0, s, r["meaningful"]) == "Not rated"
+
+
 def test_confidence_low_with_two_defaults():
     r = compute_valuation(make_bundle(drop=("beta", "Tax Provision")))
     assert confidence(r["inputs"], r["meaningful"]) == "Low"
