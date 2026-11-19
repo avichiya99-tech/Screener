@@ -17,6 +17,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 FINANCIAL_SECTORS = {"Financial Services", "Banks", "Insurance"}
+CYCLICAL_SECTORS = {"Basic Materials", "Energy"}
+EXPLICIT_YEARS = 10  # years 1-5 at the growth driver, years 6-10 fade linearly to terminal growth
 ER_PERSISTENCE = 0.7  # share of a bank's excess-return spread that survives each year after Year 5
 
 
@@ -58,20 +60,26 @@ def get_row_value(df: pd.DataFrame | None, labels: list[str], default: float = 0
     return default
 
 
-def get_historical_cagr(df: pd.DataFrame | None, labels: list[str], default: float = 0.08) -> float:
-    """Computes historical CAGR from oldest to newest available column (sanity capped)."""
+def historical_growth(df: pd.DataFrame | None, labels: list[str], default: float = 0.08) -> tuple[float, int, str]:
+    """Median year-on-year growth (robust to one bad year), clipped to [-5%, 25%].
+
+    Returns (growth, years_of_history, status). Status: 'reported' with >= 3 YoY points,
+    'estimated' with 1-2 points or when clipped, 'default' when no usable history.
+    """
     if df is None or df.empty:
-        return default
+        return float(default), 0, "default"
     for label in labels:
         if label in df.index:
-            series = pd.to_numeric(df.loc[label], errors="coerce").dropna()
-            if len(series) >= 2:
-                latest, oldest = float(series.iloc[0]), float(series.iloc[-1])
-                periods = len(series) - 1
-                if oldest > 0 and latest > 0:
-                    cagr = (latest / oldest) ** (1 / periods) - 1
-                    return float(np.clip(cagr, -0.05, 0.25))
-    return default
+            series = pd.to_numeric(df.loc[label], errors="coerce").dropna()  # newest first
+            vals = series.tolist()
+            yoy = [vals[i] / vals[i + 1] - 1 for i in range(len(vals) - 1) if vals[i] > 0 and vals[i + 1] > 0]
+            if not yoy:
+                return float(default), len(vals), "default"
+            raw = float(np.median(yoy))
+            g = float(np.clip(raw, -0.05, 0.25))
+            status = "reported" if (len(yoy) >= 3 and g == raw) else "estimated"
+            return g, len(vals), status
+    return float(default), 0, "default"
 
 
 def build_historical_eps_div_df(bundle: dict) -> pd.DataFrame:
@@ -362,6 +370,8 @@ def compute_valuation(
             "valid": True,
             "model": "Excess Return (Fin)",
             "is_financial": True,
+            "meaningful": True,
+            "not_meaningful_reason": None,
             "sector": sector,
             "currency": info.get("currency", "INR"),
             "price": price,
@@ -411,8 +421,17 @@ def compute_valuation(
     ebitda_ttm = ebit + da if ebit > 0 else get_row_value(inc, ["EBITDA"])
     tax, tax_status = _bounded((tax_p / pretax) if (pretax > 0 and tax_p) else None, 0.15, 0.35, 0.25)
     inputs.set("tax_rate", tax, tax_status)
-    hist_cagr = get_historical_cagr(inc, ["Total Revenue", "Operating Revenue"], default=0.08)
+    hist_cagr, rev_years, growth_status = historical_growth(inc, ["Total Revenue", "Operating Revenue"], default=0.08)
+    inputs.set("revenue_growth", hist_cagr, growth_status)
     rev_g = driver_override if driver_override is not None else hist_cagr
+
+    not_meaningful_reason = None
+    if ebit <= 0:
+        not_meaningful_reason = "Loss-making: DCF not meaningful"
+    elif rev_years < 3:
+        not_meaningful_reason = "Less than 3 years of history"
+    elif sector in CYCLICAL_SECTORS:
+        not_meaningful_reason = "Cyclical: earnings swing with commodity prices"
     ebit_m, ebit_status = _bounded((ebit / rev) if ebit > 0 else None, 0.02, 0.50, 0.12)
     inputs.set("ebit_margin", ebit_m, ebit_status)
     da_p, da_status = _bounded((da / rev) if da > 0 else None, 0.01, 0.15, 0.03)
@@ -431,9 +450,10 @@ def compute_valuation(
     rows = []
     crev = rev
     pv_tot = 0.0
-    for yr in range(1, 6):
+    for yr in range(1, EXPLICIT_YEARS + 1):
+        g_yr = rev_g if yr <= 5 else rev_g + (terminal_g - rev_g) * (yr - 5) / (EXPLICIT_YEARS - 5)
         prev = crev
-        crev = prev * (1 + rev_g)
+        crev = prev * (1 + g_yr)
         proj_ebit = crev * ebit_m
         nopat = proj_ebit * (1 - tax)
         proj_da = crev * da_p
@@ -455,7 +475,7 @@ def compute_valuation(
         })
 
     tv = (rows[-1]["FCFF"] * (1 + terminal_g)) / (wacc - terminal_g)
-    pv_tv = tv / ((1 + wacc) ** 5)
+    pv_tv = tv / ((1 + wacc) ** EXPLICIT_YEARS)
     ev = pv_tot + pv_tv
     eq_val = ev - debt + cash
     intrinsic = eq_val / shares
@@ -466,6 +486,9 @@ def compute_valuation(
         "valid": True,
         "model": "FCFF DCF",
         "is_financial": False,
+        "meaningful": not_meaningful_reason is None,
+        "not_meaningful_reason": not_meaningful_reason,
+        "history_years": rev_years,
         "sector": sector,
         "currency": info.get("currency", "INR"),
         "price": price,
@@ -534,7 +557,11 @@ def export_formula_excel(
     ticker: str,
     mos_pct: float = 0.25,
 ) -> bytes:
-    """Generates an IB-style, LIVE FORMULA-LINKED .xlsx workbook."""
+    """Generates an IB-style, LIVE FORMULA-LINKED .xlsx workbook.
+
+    Note: the workbook is a simple 5-year model; the site's engine uses a 10-year fade
+    projection, so the workbook's value differs from `intrinsic_price`.
+    """
     wb = openpyxl.Workbook()
 
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
