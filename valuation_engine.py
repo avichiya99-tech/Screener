@@ -225,7 +225,7 @@ def compute_dividend_quality(bundle: dict, val_res: dict) -> dict:
             growth_pts = 0
 
     if is_fin:
-        bs_pts = growth_pts
+        bs_pts = 6  # neutral: net debt / EBITDA is not meaningful for lenders
     else:
         net_debt = val_res.get("total_debt", 0.0) - val_res.get("cash", 0.0)
         ebitda = val_res.get("ebitda_ttm", 0.0)
@@ -273,6 +273,7 @@ def compute_valuation(
     driver_override: float | None = None,
     discount_override: float | None = None,
     mos_pct: float = 0.25,
+    margin_override: float | None = None,
 ) -> dict:
     """
     Sector-aware valuation engine:
@@ -434,6 +435,8 @@ def compute_valuation(
         not_meaningful_reason = "Cyclical: earnings swing with commodity prices"
     ebit_m, ebit_status = _bounded((ebit / rev) if ebit > 0 else None, 0.02, 0.50, 0.12)
     inputs.set("ebit_margin", ebit_m, ebit_status)
+    if margin_override is not None:
+        ebit_m = margin_override
     da_p, da_status = _bounded((da / rev) if da > 0 else None, 0.01, 0.15, 0.03)
     inputs.set("da_pct", da_p, da_status)
     capex_p, capex_status = _bounded((capex / rev) if capex > 0 else None, 0.01, 0.20, 0.05)
@@ -522,32 +525,102 @@ def compute_valuation(
     }
 
 
-def solve_reverse_valuation(bundle: dict, discount_rate: float, terminal_g: float = 0.05) -> float | None:
+SCENARIO_SHIFTS = {
+    # non-financials: growth shift, margin multiplier, discount shift
+    "bear": {"growth": -0.04, "margin": 0.85, "disc": 0.01, "roe": -0.03},
+    "bull": {"growth": 0.04, "margin": 1.10, "disc": -0.01, "roe": 0.03},
+}
+
+KEY_INPUTS = {
+    False: ("revenue_growth", "ebit_margin", "tax_rate", "beta", "da_pct", "capex_pct"),
+    True: ("roe", "beta", "payout", "bvps"),
+}
+
+
+def compute_scenarios(bundle: dict, macro: dict) -> dict:
+    """Bear / base / bull per-share values. Values are None when the model can't run."""
+    kw = dict(rf=macro["rf"], erp=macro["erp"], terminal_g=macro["terminal_g"], mos_pct=macro["mos_pct"])
+    base = compute_valuation(bundle, **kw)
+    out = {"bear": None, "base": None, "bull": None, "base_result": base}
+    if not base.get("valid"):
+        return out
+    out["base"] = base["intrinsic_price"]
+    for name, s in SCENARIO_SHIFTS.items():
+        if base["is_financial"]:
+            r = compute_valuation(bundle, **kw, driver_override=base["driver"] + s["roe"],
+                                  discount_override=base["discount_rate"] + s["disc"])
+        else:
+            r = compute_valuation(bundle, **kw, driver_override=base["driver"] + s["growth"],
+                                  margin_override=base["ebit_margin"] * s["margin"],
+                                  discount_override=base["discount_rate"] + s["disc"])
+        out[name] = r["intrinsic_price"] if r.get("valid") else None
+    return out
+
+
+def verdict(price: float, scenarios: dict, meaningful: bool) -> str:
+    """Cheap below the bear value, Expensive above the bull value, otherwise Fair."""
+    bear, base, bull = scenarios.get("bear"), scenarios.get("base"), scenarios.get("bull")
+    if not meaningful or bear is None or base is None or bull is None:
+        return "Not rated"
+    if price < bear:
+        return "Cheap"
+    if price > bull:
+        return "Expensive"
+    return "Fair"
+
+
+def confidence(inputs: dict, meaningful: bool) -> str:
+    """High / Medium / Low depending on how many key inputs were guessed rather than reported."""
+    if not meaningful:
+        return "Low"
+    is_fin = "roe" in inputs
+    statuses = [inputs.get(k, {"status": "default"})["status"] for k in KEY_INPUTS[is_fin]]
+    defaults = statuses.count("default")
+    estimated = statuses.count("estimated")
+    if defaults >= 2:
+        return "Low"
+    if defaults == 1 or estimated >= 2:
+        return "Medium"
+    return "High"
+
+
+REVERSE_LOW, REVERSE_HIGH, REVERSE_STEP = -0.25, 0.70, 0.05
+
+
+def solve_reverse_valuation(bundle: dict, discount_rate: float, terminal_g: float = 0.05) -> dict:
     """
-    Reverse DCF / Reverse Excess Return:
-    - Non-Financials: solves for the 5Y Revenue Growth Rate (%) implied by today's market price.
-    - Financials: solves for the 5Y ROE (%) implied by today's market price.
+    Reverse DCF / Reverse Excess Return: the growth (non-financials) or ROE (financials), in %,
+    that makes model value equal today's price.
+
+    Returns {"implied": float | None, "status": "ok" | "above_range" | "below_range" | "invalid"}.
     """
     def diff(driver_val):
-        r = compute_valuation(
-            bundle,
-            terminal_g=terminal_g,
-            driver_override=driver_val,
-            discount_override=discount_rate,
-        )
+        r = compute_valuation(bundle, terminal_g=terminal_g, driver_override=driver_val,
+                              discount_override=discount_rate)
         if not r.get("valid"):
-            return 0.0
+            return None
         return r["intrinsic_price"] - r["price"]
 
-    try:
-        low, high = (-0.25, 0.70)
-        f_lo, f_hi = diff(low), diff(high)
-        if f_lo * f_hi > 0:
-            return None
-        root = brentq(diff, low, high, xtol=1e-5)
-        return round(root * 100, 1)
-    except Exception:
-        return None
+    grid = np.round(np.arange(REVERSE_LOW, REVERSE_HIGH + 1e-9, REVERSE_STEP), 4)
+    points = [(float(x), diff(float(x))) for x in grid]
+    points = [(x, d) for x, d in points if d is not None and np.isfinite(d)]
+    if not points:
+        return {"implied": None, "status": "invalid"}
+    for (x0, d0), (x1, d1) in zip(points, points[1:]):
+        if d0 == 0:
+            return {"implied": round(x0 * 100, 1), "status": "ok"}
+        if d0 * d1 < 0:
+            try:
+                root = brentq(lambda v: diff(v) or 0.0, x0, x1, xtol=1e-6)
+                return {"implied": round(root * 100, 1), "status": "ok"}
+            except (ValueError, RuntimeError):
+                return {"implied": None, "status": "invalid"}
+    if points[-1][1] == 0:
+        return {"implied": round(points[-1][0] * 100, 1), "status": "ok"}
+    # No crossing: price is above every model value, or below every model value.
+    if all(d < 0 for _, d in points):
+        return {"implied": None, "status": "above_range"}
+    return {"implied": None, "status": "below_range"}
 
 
 def export_formula_excel(

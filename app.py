@@ -161,7 +161,7 @@ if not val.get("valid"):
     st.stop()
 
 dq = compute_dividend_quality(bundle, val)
-implied_driver = solve_reverse_valuation(bundle, val["discount_rate"], terminal_g=term_g)
+implied_driver = solve_reverse_valuation(bundle, val["discount_rate"], terminal_g=term_g)["implied"]
 curr = "₹" if val["currency"] == "INR" else f"{val['currency']} "
 
 k1, k2, k3, k4, k5 = st.columns(5)
