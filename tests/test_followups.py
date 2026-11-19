@@ -70,3 +70,33 @@ def test_run_all_completes_when_failures_scattered():
     records, legacy, failures, aborted = run_all(targets, process, workers=2, max_consecutive_failures=10)
     assert aborted is False
     assert len(records) + len(failures) == 60
+
+
+def test_dummy_placeholders_dropped_from_universe():
+    from pipeline.run import clean_symbols
+    assert clean_symbols(["TCS", " DUMMYHEG", "INFY", "dummy1", "", None]) == ["TCS", "INFY"]
+
+
+def test_failed_tickers_retried_after_cooldown():
+    from pipeline.run import retry_failures
+    waits, calls = [], []
+
+    def process(sym):
+        calls.append(sym)
+        if sym == "BAD.NS":
+            return None, {"symbol": sym, "error": "still failing"}
+        return ({"symbol": sym}, {"Ticker": sym}), None
+
+    failures = [{"symbol": "A.NS", "error": "YFRateLimitError"}, {"symbol": "BAD.NS", "error": "x"}]
+    recs, legacy, remaining = retry_failures(failures, process, cooldown=60, sleep=waits.append)
+    assert waits == [60]
+    assert calls == ["A.NS", "BAD.NS"]  # one at a time, in order
+    assert [r["symbol"] for r in recs] == ["A.NS"] and legacy == [{"Ticker": "A.NS"}]
+    assert remaining == [{"symbol": "BAD.NS", "error": "still failing"}]
+
+
+def test_no_retry_pass_without_failures():
+    from pipeline.run import retry_failures
+    waits = []
+    assert retry_failures([], lambda s: None, sleep=waits.append) == ([], [], [])
+    assert waits == []

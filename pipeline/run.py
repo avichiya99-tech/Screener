@@ -11,7 +11,9 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,13 +36,23 @@ NIFTY500_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500lis
 FALLBACK_SYMBOLS = DATA_DIR / "nifty500_symbols.csv"
 
 
+def clean_symbols(symbols) -> list[str]:
+    """Strip blanks and NSE's temporary DUMMY* placeholders (used during index changes)."""
+    out = []
+    for s in symbols:
+        s = str(s).strip() if s is not None else ""
+        if s and s.upper() != "NONE" and not s.upper().startswith("DUMMY"):
+            out.append(s)
+    return out
+
+
 def load_nifty500_symbols() -> list[str]:
     """Live NIFTY 500 list from NSE; falls back to data/nifty500_symbols.csv (refreshed on each success)."""
     try:
         resp = requests.get(NIFTY500_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         resp.raise_for_status()
         df = pd.read_csv(io.StringIO(resp.text))
-        symbols = df["Symbol"].dropna().str.strip().tolist()
+        symbols = clean_symbols(df["Symbol"].dropna())
         if len(symbols) >= 100:
             FALLBACK_SYMBOLS.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame({"Symbol": symbols}).to_csv(FALLBACK_SYMBOLS, index=False)
@@ -49,7 +61,7 @@ def load_nifty500_symbols() -> list[str]:
         print(f"NSE list unavailable ({exc}); using {FALLBACK_SYMBOLS}", file=sys.stderr)
     if FALLBACK_SYMBOLS.exists():
         df = pd.read_csv(FALLBACK_SYMBOLS)
-        return [f"{s.strip()}.NS" for s in df["Symbol"].dropna()]
+        return [f"{s}.NS" for s in clean_symbols(df["Symbol"].dropna())]
     raise FileNotFoundError("Could not fetch the NIFTY 500 list and no fallback CSV exists.")
 
 
@@ -226,6 +238,31 @@ def run_all(targets: list[str], process, workers: int = 4,
     return records, legacy, failures, stop.is_set()
 
 
+RETRY_COOLDOWN_SECONDS = 60
+
+
+def retry_failures(failures: list[dict], process, cooldown: int = RETRY_COOLDOWN_SECONDS,
+                   sleep=time.sleep) -> tuple[list, list, list]:
+    """Second pass for tickers that failed (mostly Yahoo rate limits): wait, then retry one at a time.
+
+    Returns (records, legacy_rows, still_failing)."""
+    if not failures:
+        return [], [], []
+    sleep(cooldown)
+    records, legacy, remaining = [], [], []
+    for f in failures:
+        try:
+            ok, fail = process(f["symbol"])
+        except Exception as exc:
+            ok, fail = None, {"symbol": f["symbol"], "error": f"{type(exc).__name__}: {exc}"}
+        if ok:
+            records.append(ok[0])
+            legacy.append(ok[1])
+        else:
+            remaining.append(fail or f)
+    return records, legacy, remaining
+
+
 def main() -> int:
     macro, rf_source = live_macro(load_macro())
     print(f"Risk-free rate {macro['rf']:.4%} from {rf_source}")
@@ -241,12 +278,18 @@ def main() -> int:
     print(f"Prices: {price_source}. Betas vs NIFTY 50 for {len(betas)}/{len(targets)}. "
           f"Valuing {len(targets)} NIFTY 500 stocks...")
 
-    records, legacy, failures, aborted = run_all(targets, lambda s: _process(s, macro, as_of, closes, betas, dividends))
+    process = partial(_process, macro=macro, as_of=as_of, closes=closes, betas=betas, dividends=dividends)
+    records, legacy, failures, aborted = run_all(targets, process)
     if aborted:
         print(f"Stopped after {MAX_CONSECUTIVE_FAILURES} failures in a row (data source blocking?); "
               f"kept previous data. Last error: {failures[-1]['error']}", file=sys.stderr)
         return 1
 
+    if failures:
+        print(f"Retrying {len(failures)} failed tickers after a {RETRY_COOLDOWN_SECONDS}s cooldown...")
+        more, more_legacy, failures = retry_failures(failures, process)
+        records += more
+        legacy += more_legacy
     failures.sort(key=lambda f: f["symbol"])
     sources = {"prices": price_source, "statements": SOURCE_NAME, "universe": "NSE NIFTY 500 list",
                "rf": rf_source, "beta": "2y weekly regression vs NIFTY 50 (^NSEI), Blume-adjusted",
