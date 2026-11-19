@@ -1,6 +1,8 @@
 """Turn one fetched bundle into the per-stock record the site reads."""
 from __future__ import annotations
 
+import pandas as pd
+
 from valuation_engine import (
     build_historical_eps_div_df,
     compute_dividend_quality,
@@ -12,7 +14,7 @@ from valuation_engine import (
 
 RECORD_KEYS = (
     "symbol", "name", "sector", "model", "price", "market_cap_cr", "w52_high", "w52_low",
-    "verdict", "confidence", "meaningful", "not_meaningful_reason",
+    "verdict", "confidence", "price_source", "data_checks", "meaningful", "not_meaningful_reason",
     "scenarios", "upside_pct", "mos_buy_price",
     "implied_driver", "hist_driver", "driver_label",
     "inputs", "projection", "dividend", "eps_dps_history", "pe", "as_of",
@@ -36,12 +38,61 @@ def _r(x, n=2):
     return None if x is None else round(float(x), n)
 
 
-def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = None) -> dict:
+PRICE_TOLERANCE = 0.03       # Yahoo vs NSE official close
+MCAP_TOLERANCE = 0.25        # price x shares vs reported market cap
+STALE_RESULTS_DAYS = 548     # ~18 months
+
+
+def data_checks(info: dict, income, yahoo_price: float, official_price: dict | None, as_of: str | None) -> list[str]:
+    """Plain-English warnings when the inputs look unreliable. Any warning drops confidence to Low."""
+    checks = []
+    if official_price and official_price.get("close"):
+        nse = official_price["close"]
+        gap = abs(yahoo_price - nse) / nse
+        if gap > PRICE_TOLERANCE:
+            checks.append(f"Yahoo price differs from NSE close by {gap:.0%}")
+    shares, mcap = info.get("sharesOutstanding"), info.get("marketCap")
+    if shares and mcap and yahoo_price:
+        gap = abs(yahoo_price * shares - mcap) / mcap
+        if gap > MCAP_TOLERANCE:
+            checks.append(f"Reported share count doesn't match market cap ({gap:.0%} off)")
+    if as_of and income is not None and not income.empty:
+        latest = pd.to_datetime(pd.Index(income.columns), errors="coerce").max()
+        if pd.notna(latest) and (pd.Timestamp(as_of) - latest).days > STALE_RESULTS_DAYS:
+            checks.append(f"Latest annual results ({latest.date()}) are older than 18 months")
+    return checks
+
+
+def statements_currency(info: dict) -> tuple[str, str]:
+    """(statement currency, quote currency)."""
+    quote = info.get("currency") or "INR"
+    return (info.get("financialCurrency") or quote), quote
+
+
+def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = None,
+                 official_price: dict | None = None, fx_rate: float | None = None) -> dict:
     info = bundle.get("info") or {}
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    shares = info.get("sharesOutstanding")
-    if not price or price <= 0:
+    yahoo_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    if not yahoo_price or yahoo_price <= 0:
         raise RecordError("missing price")
+    fin_ccy, quote_ccy = statements_currency(info)
+    if fin_ccy != quote_ccy:
+        # e.g. Infosys files in USD but trades in INR: convert statements before valuing.
+        if not fx_rate or fx_rate <= 0:
+            raise RecordError(f"statements in {fin_ccy}, no {fin_ccy}{quote_ccy} exchange rate")
+        bundle = {**bundle, **{k: bundle[k] * fx_rate for k in ("income", "balance", "cashflow")
+                               if bundle.get(k) is not None}}
+    checks = data_checks(info, bundle.get("income"), yahoo_price, official_price, as_of)
+    if official_price and official_price.get("close"):
+        # Value on the exchange's official close, not Yahoo's quote.
+        price = official_price["close"]
+        price_source = f"NSE official close ({official_price.get('date')})"
+        info = {**info, "currentPrice": price}
+        bundle = {**bundle, "info": info}
+    else:
+        price = yahoo_price
+        price_source = "yfinance (unofficial)"
+    shares = info.get("sharesOutstanding")
 
     sc = compute_scenarios(bundle, macro)
     val = sc["base_result"]
@@ -73,7 +124,9 @@ def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = Non
         "w52_high": _r(info.get("fiftyTwoWeekHigh")),
         "w52_low": _r(info.get("fiftyTwoWeekLow")),
         "verdict": verdict(price, sc, meaningful),
-        "confidence": confidence(val.get("inputs", {}), meaningful),
+        "confidence": "Low" if checks else confidence(val.get("inputs", {}), meaningful),
+        "price_source": price_source,
+        "data_checks": checks,
         "meaningful": meaningful,
         "not_meaningful_reason": reason,
         "scenarios": {k: (_r(sc[k]) if rated else None) for k in ("bear", "base", "bull")},

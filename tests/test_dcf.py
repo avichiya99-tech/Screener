@@ -49,6 +49,7 @@ def test_short_history_not_meaningful():
 
 
 def test_cyclical_not_meaningful():
-    r = compute_valuation(make_bundle(sector="Energy"))
+    # volatile margins in a commodity sector (stable ones are rated on normalized margins)
+    r = compute_valuation(make_bundle(sector="Energy", ebit=(300, 60, 250, 20)))
     assert r["meaningful"] is False
     assert "Cyclical" in r["not_meaningful_reason"]

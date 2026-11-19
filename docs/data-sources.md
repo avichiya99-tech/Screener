@@ -29,5 +29,17 @@ Because the statements row is not `licensed-ok`, the spec's fallback applies. **
 
 **The route to fully official data** is to write to NSE Data & Analytics asking for a non-commercial waiver under policy clause 8.3. This is the user's decision.
 
-## User decision
-_Pending. To be recorded after review._
+## User decision (2026-11-20)
+The user asked for "the most reliable and professional" sources. Within the free, non-commercial constraint, that is:
+
+| Field | Source now | Why it's the most reliable available | Fallback |
+|---|---|---|---|
+| Price used for valuation | **NSE official closing price**, from NSE's public daily bhavcopy file (`pipeline/sources/nse_bhavcopy.py`) | The exchange's own settlement close. Yahoo is only cross-checked against it; a gap above 3% is flagged and drops confidence to Low. | yfinance quote, labelled unofficial |
+| Risk-free rate | **CCIL 10Y central G-sec benchmark**, fetched every night (`pipeline/sources/ccil_rf.py`) | CCIL is the clearing house for Indian government bonds. State bonds (SGS) are excluded. | `config/macro.json` (7.28%, 2026-11-20) |
+| Beta | **Our own regression vs NIFTY 50**: 2 years of weekly returns, Blume-adjusted (`pipeline/sources/beta.py`) | Yahoo's beta for Indian stocks is measured against the US S&P 500 (TCS 0.08, Infosys 0.02), which is meaningless for India. | 1.0, marked `default` |
+| Statements | yfinance, converted to rupees when a company reports in USD (Infosys) | No free official alternative can be read by a script (see below). Guarded by automatic data checks. | — |
+| Data checks | price vs NSE close, share count vs market cap, results older than 18 months | Any failed check shows the reason and drops confidence to Low. | — |
+
+**Not used, on purpose:** NSE's website APIs (corporate filings, XBRL). They sit behind bot protection that requires harvesting session cookies, and NSE's policy forbids that kind of access. Getting past it would be unauthorized access, so the pipeline only reads NSE's public archive file.
+
+**The route to official statements** is still a licence from NSE Data & Analytics (or a non-commercial waiver under clause 8.3), or a paid licensed vendor. When one is in place, it plugs in as another adapter in `pipeline/sources/` without changing the engine.

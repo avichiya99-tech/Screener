@@ -13,6 +13,11 @@ from valuation_engine import (
     export_formula_excel,
     simulate_values,
 )
+from pipeline.build import statements_currency
+from pipeline.config import load_macro
+from pipeline.sources.beta import compute_betas
+from pipeline.sources.ccil_rf import live_macro
+from pipeline.sources.fx import fx_rate
 
 st.set_page_config(page_title="India Valuation & Dividend Workbench", layout="wide")
 
@@ -25,16 +30,33 @@ def load_daily_screener() -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+@st.cache_data(ttl=6 * 3600)
+def official_rf() -> float:
+    """10Y G-sec yield from CCIL (falls back to config/macro.json)."""
+    return live_macro(load_macro())[0]["rf"]
+
+
 @st.cache_data(ttl=3600)
 def fetch_bundle(sym: str) -> dict:
     t = yf.Ticker(sym)
-    return {
+    b = {
         "info": t.info or {},
         "income": t.financials,
         "balance": t.balance_sheet,
         "cashflow": t.cashflow,
         "dividends": t.dividends,
     }
+    if sym.endswith((".NS", ".BO")):
+        # Same as the nightly pipeline: beta vs NIFTY 50, not Yahoo's S&P 500 beta.
+        b["info"] = {**b["info"], "beta": compute_betas([sym]).get(sym)}
+    fin_ccy, quote_ccy = statements_currency(b["info"])
+    rate = fx_rate(fin_ccy, quote_ccy) if fin_ccy != quote_ccy else None
+    if rate:
+        for k in ("income", "balance", "cashflow"):
+            if b[k] is not None:
+                b[k] = b[k] * rate
+        b["info"] = {**b["info"], "financialCurrency": quote_ccy}
+    return b
 
 
 st.title("India's Open Valuation & Dividend Sustainability Workbench")
@@ -123,7 +145,8 @@ active_ticker = custom_ticker if custom_ticker else selected_ticker
 
 st.sidebar.divider()
 st.sidebar.header("2. Deep-Dive Assumptions")
-rf_rate = st.sidebar.slider("Risk-Free Rate (10Y G-Sec %)", 4.0, 10.0, 7.0, 0.1) / 100
+rf_rate = st.sidebar.slider("Risk-Free Rate (10Y G-Sec %, live from CCIL)", 4.0, 10.0,
+                            round(official_rf() * 100, 1), 0.1) / 100
 erp_rate = st.sidebar.slider("Equity Risk Premium (%)", 3.0, 9.0, 5.5, 0.1) / 100
 term_g = st.sidebar.slider("Terminal Growth Rate (%)", 2.0, 7.0, 5.0, 0.25) / 100
 

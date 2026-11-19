@@ -60,7 +60,7 @@ def test_confidence_high_clean_bundle():
 
 
 def test_confidence_low_when_not_meaningful():
-    r = compute_valuation(make_bundle(sector="Energy"))
+    r = compute_valuation(make_bundle(sector="Energy", ebit=(300, 60, 250, 20)))
     assert confidence(r["inputs"], r["meaningful"]) == "Low"
 
 

@@ -19,7 +19,17 @@ from openpyxl.utils import get_column_letter
 FINANCIAL_SECTORS = {"Financial Services", "Banks", "Insurance"}
 CYCLICAL_SECTORS = {"Basic Materials", "Energy"}
 EXPLICIT_YEARS = 10  # years 1-5 at the growth driver, years 6-10 fade linearly to terminal growth
-ER_PERSISTENCE = 0.7  # share of a bank's excess-return spread that survives each year after Year 5
+# Banks / NBFCs: 3-stage excess-return model (the standard sell-side approach for lenders).
+#   Years 1-5  : current ROE.
+#   Years 6-10 : ROE fades linearly to a long-run "stable ROE".
+#   Terminal   : Gordon growth on the stable spread, i.e. justified P/B = (ROE_s - g) / (Ke - g).
+# Competition erodes, but rarely erases, a strong franchise's edge: the stable ROE keeps
+# TERMINAL_SPREAD_SHARE of today's spread over Ke, capped at MAX_TERMINAL_SPREAD.
+TERMINAL_SPREAD_SHARE = 0.5
+MAX_TERMINAL_SPREAD = 0.05
+
+# Cyclicals: value on through-the-cycle (average) margins; refuse to rate when margins swing too much.
+CYCLICAL_MARGIN_STDEV_MAX = 0.05  # 5 percentage points
 
 
 class Inputs:
@@ -265,6 +275,35 @@ def compute_dividend_quality(bundle: dict, val_res: dict) -> dict:
     }
 
 
+def yearly_margins(inc: pd.DataFrame | None) -> list[float]:
+    """EBIT / revenue for every year where both are reported (newest first)."""
+    if inc is None or inc.empty:
+        return []
+    rev_lbl = next((l for l in ("Total Revenue", "Operating Revenue") if l in inc.index), None)
+    ebit_lbl = next((l for l in ("EBIT", "Operating Income") if l in inc.index), None)
+    if rev_lbl is None or ebit_lbl is None:
+        return []
+    rev = pd.to_numeric(inc.loc[rev_lbl], errors="coerce")
+    ebit = pd.to_numeric(inc.loc[ebit_lbl], errors="coerce")
+    ok = rev.notna() & ebit.notna() & (rev > 0)
+    return [float(e / r) for e, r in zip(ebit[ok], rev[ok])]
+
+
+def stable_bank_roe(roe: float, ke: float) -> float:
+    """Long-run ROE: keeps TERMINAL_SPREAD_SHARE of today's spread over Ke, capped at MAX_TERMINAL_SPREAD."""
+    spread = np.minimum(TERMINAL_SPREAD_SHARE * (np.asarray(roe) - ke), MAX_TERMINAL_SPREAD)
+    out = ke + spread
+    return float(out) if np.ndim(out) == 0 else out
+
+
+def bank_roe_path(roe, stable_roe) -> list:
+    """ROE for years 1..EXPLICIT_YEARS: flat for 5 years, then a linear fade to stable_roe.
+    Works on floats or numpy arrays."""
+    fade_years = EXPLICIT_YEARS - 5
+    return [roe if yr <= 5 else roe + (stable_roe - roe) * (yr - 5) / fade_years
+            for yr in range(1, EXPLICIT_YEARS + 1)]
+
+
 def compute_valuation(
     bundle: dict,
     rf: float = 0.07,
@@ -277,8 +316,9 @@ def compute_valuation(
 ) -> dict:
     """
     Sector-aware valuation engine:
-    - Non-Financials: 5-Year FCFF DCF (driver = 5Y Revenue Growth Rate, discount = WACC)
-    - Banks / NBFCs / Insurance: 5-Year Residual Income / Excess Return Model (driver = Expected ROE, discount = Ke)
+    - Non-Financials: 10-Year FCFF DCF (driver = revenue growth, fading to terminal g; discount = WACC).
+      Cyclical sectors use through-the-cycle (average) EBIT margins.
+    - Banks / NBFCs / Insurance: 3-stage Excess Return Model (driver = ROE, fading to a stable ROE; discount = Ke)
     """
     info = bundle.get("info") or {}
     inc = bundle.get("income")
@@ -350,18 +390,20 @@ def compute_valuation(
         if disc <= terminal_g:
             return {"valid": False, "is_financial": True, "reason": "Cost of Equity must exceed Terminal Growth"}
 
+        stable_roe = stable_bank_roe(roe, disc)
         rows = []
         curr_bv = bvps
         pv_er_total = 0.0
-        for yr in range(1, 6):
-            eps_proj = curr_bv * roe
+        for yr, roe_yr in enumerate(bank_roe_path(roe, stable_roe), start=1):
+            eps_proj = curr_bv * roe_yr
             dps_proj = eps_proj * payout
-            excess_ret = curr_bv * (roe - disc)
+            excess_ret = curr_bv * (roe_yr - disc)
             pv_er = excess_ret / ((1 + disc) ** yr)
             pv_er_total += pv_er
             end_bv = curr_bv + (eps_proj - dps_proj)
             rows.append({
                 "Year": f"Year {yr}",
+                "ROE": roe_yr,
                 "Begin BVPS": curr_bv,
                 "Projected EPS": eps_proj,
                 "Projected DPS": dps_proj,
@@ -371,11 +413,9 @@ def compute_valuation(
             })
             curr_bv = end_bv
 
-        # Terminal: the excess-return spread fades by ER_PERSISTENCE each year after Year 5
-        # (Ohlson persistence), instead of earning a fixed share of it forever.
-        term_er = curr_bv * (roe - disc)
-        tv_er = term_er / (1 + disc - ER_PERSISTENCE)
-        pv_tv_er = tv_er / ((1 + disc) ** 5)
+        # Terminal: book value grows at g and earns the stable spread forever.
+        tv_er = curr_bv * (stable_roe - disc) / (disc - terminal_g)
+        pv_tv_er = tv_er / ((1 + disc) ** EXPLICIT_YEARS)
 
         intrinsic = bvps + pv_er_total + pv_tv_er
         upside = ((intrinsic - price) / price) * 100
@@ -402,7 +442,8 @@ def compute_valuation(
             "pv_er_total": pv_er_total,
             "tv_er": tv_er,
             "pv_tv_er": pv_tv_er,
-            "terminal_method": f"persistence_{ER_PERSISTENCE}",
+            "terminal_method": "stable_roe",
+            "stable_roe": stable_roe,
             "inputs": inputs.as_dict(),
             "intrinsic_price": intrinsic,
             "mos_buy_price": mos_buy,
@@ -446,9 +487,18 @@ def compute_valuation(
         not_meaningful_reason = "Loss-making: DCF not meaningful"
     elif rev_years < 3:
         not_meaningful_reason = "Less than 3 years of history"
-    elif sector in CYCLICAL_SECTORS:
-        not_meaningful_reason = "Cyclical: earnings swing with commodity prices"
-    ebit_m, ebit_status = _bounded((ebit / rev) if ebit > 0 else None, 0.02, 0.50, 0.12)
+    raw_margin = (ebit / rev) if ebit > 0 else None
+    margin_method = "latest"
+    if sector in CYCLICAL_SECTORS and not_meaningful_reason is None:
+        margins = yearly_margins(inc)
+        if len(margins) < 3:
+            not_meaningful_reason = "Cyclical: not enough margin history to normalize"
+        elif min(margins) <= 0 or float(np.std(margins)) > CYCLICAL_MARGIN_STDEV_MAX:
+            not_meaningful_reason = "Cyclical: margins swing too much across the cycle to value reliably"
+        else:
+            raw_margin = float(np.mean(margins))  # through-the-cycle margin, not this year's
+            margin_method = "normalized"
+    ebit_m, ebit_status = _bounded(raw_margin, 0.02, 0.50, 0.12)
     inputs.set("ebit_margin", ebit_m, ebit_status)
     if margin_override is not None:
         ebit_m = margin_override
@@ -518,6 +568,7 @@ def compute_valuation(
         "driver": rev_g,
         "driver_label": "Rev Growth",
         "ebit_margin": ebit_m,
+        "margin_method": margin_method,
         "tax_rate": tax,
         "da_pct": da_p,
         "capex_pct": capex_p,
@@ -617,13 +668,14 @@ def simulate_values(val: dict, terminal_g: float, n: int = 5000, seed: int = 42,
     disc = np.maximum(rng.normal(val["discount_rate"], 0.01 * noise, n), terminal_g + 0.01)
     if val["is_financial"]:
         roe = np.clip(rng.normal(val["driver"], 0.02 * noise, n), 0.04, 0.35) if noise else np.full(n, val["driver"])
+        stable = stable_bank_roe(roe, disc)
         bv = np.full(n, val["bvps"], dtype=float)
         pv_er = np.zeros(n)
-        for yr in range(1, 6):
-            pv_er += bv * (roe - disc) / ((1 + disc) ** yr)
-            bv = bv + bv * roe * (1 - val["payout_ratio_model"])
-        tv = bv * (roe - disc) / (1 + disc - ER_PERSISTENCE)
-        return val["bvps"] + pv_er + tv / ((1 + disc) ** 5)
+        for yr, roe_yr in enumerate(bank_roe_path(roe, stable), start=1):
+            pv_er += bv * (roe_yr - disc) / ((1 + disc) ** yr)
+            bv = bv + bv * roe_yr * (1 - val["payout_ratio_model"])
+        tv = bv * (stable - disc) / (disc - terminal_g)
+        return val["bvps"] + pv_er + tv / ((1 + disc) ** EXPLICIT_YEARS)
 
     g0 = rng.normal(val["driver"], 0.03 * noise, n)
     margin = np.clip(rng.normal(val["ebit_margin"], 0.02 * noise, n), 0.01, 0.65) if noise else np.full(n, val["ebit_margin"])
@@ -845,6 +897,7 @@ def export_formula_excel(
             ("Terminal Growth Rate", val["terminal_g"], "0.00%"),
             ("Current Market Price", val["price"], "#,##0.00"),
             ("Margin of Safety Target", mos_pct, "0.0%"),
+            ("Stable (Terminal) ROE", val.get("stable_roe", val["discount_rate"]), "0.0%"),
         ]
         for idx, (label, value, fmt) in enumerate(assumptions, start=5):
             ws[f"A{idx}"] = label
@@ -904,7 +957,7 @@ def export_formula_excel(
         bridge = [
             (24, "Beginning Book Value / Share", "=$B$5", "#,##0.00", False),
             (25, "PV of Explicit Excess Returns (Yr 1-5)", "=SUM(B20:F20)", "#,##0.00", False),
-            (26, f"Terminal Excess Return Value (fades {ER_PERSISTENCE:.0%}/yr)", f"=(F21*($B$6-$B$8))/(1+$B$8-{ER_PERSISTENCE})", "#,##0.00", False),
+            (26, "Terminal Excess Return Value (stable ROE, Gordon)", "=(F21*($B$12-$B$8))/($B$8-$B$9)", "#,##0.00", False),
             (27, "PV of Terminal Excess Return", "=B26/((1+$B$8)^5)", "#,##0.00", False),
             (28, "Intrinsic Share Price", "=B24+B25+B27", "#,##0.00", True),
             (29, "Current Market Price", "=$B$10", "#,##0.00", False),

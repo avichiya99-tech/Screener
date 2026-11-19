@@ -12,16 +12,6 @@ def test_bank_roe_equals_ke_gives_book_value():
     assert abs(r["intrinsic_price"] - r["bvps"]) < 1e-6
 
 
-def test_bank_terminal_uses_persistence():
-    r = compute_valuation(make_bank_bundle())
-    assert r["terminal_method"] == "persistence_0.7"
-    # Persistence fade must value the spread less than the old "75% forever" terminal.
-    disc, roe = r["discount_rate"], r["driver"]
-    end_bv = r["projection_df"]["End BVPS"].iloc[-1]
-    old_pv_tv = end_bv * 0.75 * (roe - disc) / (disc - 0.05) / (1 + disc) ** 5
-    assert r["pv_tv_er"] < old_pv_tv
-
-
 def test_missing_beta_marked_default():
     r = compute_valuation(make_bundle(drop=("beta",)))
     assert r["inputs"]["beta"]["status"] == "default"
@@ -49,4 +39,5 @@ def test_load_macro(tmp_path):
 
 def test_repo_macro_config_has_spec_values():
     m = load_macro()
-    assert (m["rf"], m["erp"], m["terminal_g"], m["mos_pct"]) == (0.07, 0.055, 0.05, 0.25)
+    assert (m["erp"], m["terminal_g"], m["mos_pct"]) == (0.055, 0.05, 0.25)
+    assert 0.05 <= m["rf"] <= 0.09  # fallback 10Y G-sec; the live value comes from CCIL

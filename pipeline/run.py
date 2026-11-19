@@ -18,9 +18,13 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from pipeline.build import build_record, summary_row
+from pipeline.build import build_record, statements_currency, summary_row
 from pipeline.config import load_macro
 from pipeline.jsonsafe import to_jsonable
+from pipeline.sources.beta import compute_betas
+from pipeline.sources.ccil_rf import live_macro
+from pipeline.sources.fx import fx_rate
+from pipeline.sources.nse_bhavcopy import latest_closes
 from pipeline.sources.yfinance_source import SOURCE_NAME, fetch_bundle
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -158,13 +162,20 @@ def legacy_row(record: dict, bundle: dict) -> dict:
     }
 
 
-def _process(symbol: str, macro: dict, as_of: str):
+def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, betas: dict | None = None):
     res = fetch_bundle(symbol)
     if res.bundle is None:
         return None, {"symbol": symbol, "error": res.error}
     try:
-        rec = build_record(symbol, res.bundle, macro, as_of=as_of)
-        return (rec, legacy_row(rec, res.bundle)), None
+        bundle = res.bundle
+        if betas is not None:
+            # Our NIFTY 50 beta replaces Yahoo's S&P 500 one; no beta -> engine default 1.0, marked "default".
+            bundle = {**bundle, "info": {**bundle["info"], "beta": betas.get(symbol)}}
+        fin_ccy, quote_ccy = statements_currency(bundle["info"])
+        official = (closes or {}).get(symbol.replace(".NS", ""))
+        rec = build_record(symbol, bundle, macro, as_of=as_of, official_price=official,
+                           fx_rate=fx_rate(fin_ccy, quote_ccy))
+        return (rec, legacy_row(rec, bundle)), None
     except Exception as exc:  # one bad ticker never stops the run
         return None, {"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -213,23 +224,30 @@ def run_all(targets: list[str], process, workers: int = 4,
 
 
 def main() -> int:
-    macro = load_macro()
+    macro, rf_source = live_macro(load_macro())
+    print(f"Risk-free rate {macro['rf']:.4%} from {rf_source}")
     symbols = load_nifty500_symbols()
     limit = int(os.environ.get("MAX_STOCKS", "0"))
     targets = symbols[:limit] if limit > 0 else symbols
     now = datetime.now(timezone.utc)
     as_of = now.astimezone(IST).date().isoformat()
-    print(f"Valuing {len(targets)} NIFTY 500 stocks...")
+    closes, close_day = latest_closes(now.astimezone(IST).date())
+    price_source = (f"NSE official close ({close_day.isoformat()}); yfinance fallback" if closes
+                    else "yfinance (unofficial) - NSE bhavcopy unavailable")
+    betas = compute_betas(targets)
+    print(f"Prices: {price_source}. Betas vs NIFTY 50 for {len(betas)}/{len(targets)}. "
+          f"Valuing {len(targets)} NIFTY 500 stocks...")
 
-    records, legacy, failures, aborted = run_all(targets, lambda s: _process(s, macro, as_of))
+    records, legacy, failures, aborted = run_all(targets, lambda s: _process(s, macro, as_of, closes, betas))
     if aborted:
         print(f"Stopped after {MAX_CONSECUTIVE_FAILURES} failures in a row (data source blocking?); "
               f"kept previous data. Last error: {failures[-1]['error']}", file=sys.stderr)
         return 1
 
     failures.sort(key=lambda f: f["symbol"])
-    sources = {"prices": SOURCE_NAME, "statements": SOURCE_NAME, "universe": "NSE NIFTY 500 list",
-               "rf": f"config/macro.json (updated {macro['updated_on']})"}
+    sources = {"prices": price_source, "statements": SOURCE_NAME, "universe": "NSE NIFTY 500 list",
+               "rf": rf_source, "beta": "2y weekly regression vs NIFTY 50 (^NSEI), Blume-adjusted",
+               "fx": "yfinance FX close, for companies reporting in USD"}
     if not write_outputs(records, failures, DATA_DIR, now, macro=macro, sources=sources):
         print(f"Only {len(records)}/{len(targets)} succeeded; kept previous data.", file=sys.stderr)
         return 1

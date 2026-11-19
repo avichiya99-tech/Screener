@@ -51,3 +51,38 @@ The run used live yfinance data on 2026-11-19, with the same macro inputs as v1 
 
 ## Update after final review fixes
 Re-running the same 20 stocks gives 7 Not rated, 6 Expensive, 5 Fair, 2 Cheap. ADANIGREEN and ADANIENSOL are now Not rated, because their bear-case value is negative and the valuation is too sensitive to assumptions. "Not rated" stocks no longer publish fair values.
+
+## Update 2026-11-20: professional-grade models and official sources
+Changes:
+- **Banks/NBFCs:** 3-stage excess-return model. ROE is held for 5 years, then fades over years 6–10 to a stable ROE (Ke + half of today's spread, spread capped at 5 points). The terminal value is Gordon growth on that stable spread (justified P/B). This replaces the 0.7 persistence fade, which wiped out almost all of a strong franchise's edge within a few years.
+- **Cyclicals:** valued on the average (through-the-cycle) EBIT margin. "Not rated" only when margins actually swing (standard deviation above 5 points, or a loss year). Asian Paints is rated again; Coal India stays Not rated because its margins swing.
+- **Beta:** regression vs NIFTY 50 instead of Yahoo's S&P 500 beta (which was 0.02–0.4 for most Indian stocks and was clipped to 0.4, making the cost of equity about 9.5%).
+- **Rate:** live CCIL 10Y G-sec, 7.2752% on 2026-11-19.
+- **Currency:** USD statements are converted to INR. Infosys went from ₹20 to ₹1,273.
+
+Live run, 20 key stocks, 2026-11-20 (values in ₹ per share):
+
+| Stock | Price | Base (bear–bull) | Verdict | Beta | Driver |
+|---|--:|--|--|--:|--|
+| HDFCBANK | 822 | 309 (193–489) | Expensive | 1.07 | ROE 11.0% |
+| ICICIBANK | 1,609 | 812 (510–1,298) | Expensive | 1.05 | ROE 16.5% |
+| SBIN | 1,156 | 941 (583–1,524) | Fair | 0.95 | ROE 14.7% |
+| KOTAKBANK | 503 | 193 (108–345) | Expensive | 0.85 | ROE 11.8% |
+| AXISBANK | 1,381 | 782 (460–1,324) | Expensive | 1.13 | ROE 13.9% |
+| BAJFINANCE | 1,093 | 325 (213–499) | Expensive | 1.29 | ROE 19.0% |
+| BAJAJFINSV | 1,885 | 665 (396–1,114) | Expensive | 1.11 | ROE 15.2% |
+| ASIANPAINT | 2,595 | 548 (315–894) | Expensive | 0.94 | growth 2.9%, margin 17.9% (normalized) |
+| GRASIM | 3,111 | — | Not rated (bear case negative) | 1.03 | |
+| COALINDIA | 392 | — | Not rated (cyclical, margins swing) | 0.60 | |
+| ULTRACEMCO | 12,560 | 1,652 (357–3,486) | Expensive | 1.16 | |
+| TATASTEEL | 181 | — | Not rated (bear case negative) | 1.16 | |
+| RELIANCE | 1,376 | 366 (57–822) | Expensive | 1.11 | |
+| ONGC | 225 | 360 (111–819) | Fair | 0.76 | |
+| ACC | 1,269 | 2,052 (1,222–3,248) | Fair | 1.10 | |
+| DIVISLAB | 11,178 | 761 (321–1,402) | Expensive | 0.92 | |
+| DMART | 3,500 | — | Not rated (negative value) | 0.85 | |
+| TCS | 2,343 | 2,281 (1,365–3,674) | Fair | 0.85 | |
+| INFY | 1,092 | 1,273 (778–2,037) | Fair | 0.80 | USD statements converted |
+| HINDUNILVR | 2,074 | 677 (403–1,105) | Expensive | 0.74 | growth 2.4% |
+
+**Reading it:** with a realistic cost of equity (about 13%: 7.3% rate + beta × 5.5%), most large caps are priced above what their own cash flows justify. That reflects the market's high multiples, not a model bug. Remaining weak spot: Yahoo's bank figures are internally inconsistent (for example, HDFC Bank's balance-sheet equity doesn't match its book value per share × shares), which is why licensed statements are the next step for accuracy.
