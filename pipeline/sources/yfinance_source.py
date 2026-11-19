@@ -17,8 +17,10 @@ class FetchResult:
     source: str = SOURCE_NAME
 
 
-def fetch_bundle(symbol: str, retries: int = 3, sleep=time.sleep) -> FetchResult:
-    """Fetch one ticker. Empty info / no price counts as a failure and is retried (2s, 4s, 8s...)."""
+def fetch_bundle(symbol: str, retries: int = 3, sleep=time.sleep, dividends=None) -> FetchResult:
+    """Fetch one ticker. Empty info / no price counts as a failure and is retried (2s, 4s, 8s...).
+
+    Pass `dividends` (from the batch download) to skip the per-ticker dividend request."""
     attempts = retries + 1
     last_error = f"no price after {attempts} attempts"
     for attempt in range(attempts):
@@ -35,7 +37,7 @@ def fetch_bundle(symbol: str, retries: int = 3, sleep=time.sleep) -> FetchResult
                         "income": income,
                         "balance": t.balance_sheet,
                         "cashflow": t.cashflow,
-                        "dividends": t.dividends,
+                        "dividends": t.dividends if dividends is None else dividends,
                     }, None)
                 last_error = f"no financial statements after {attempts} attempts"
             else:

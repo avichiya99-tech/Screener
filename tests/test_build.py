@@ -1,5 +1,3 @@
-import pandas as pd
-
 from conftest import make_bank_bundle, make_bundle
 from pipeline.build import RECORD_KEYS, SUMMARY_KEYS, build_record, summary_row
 from pipeline.sources import yfinance_source

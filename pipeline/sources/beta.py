@@ -1,4 +1,4 @@
-"""Beta against the NIFTY 50, computed by us.
+"""Batch price history: beta against the NIFTY 50 (computed by us) and dividend history.
 
 Yahoo's `beta` for Indian stocks is measured against the US S&P 500, which makes it close to
 zero for most of them (TCS 0.08, Infosys 0.02 in Nov 2026). Professional practice for India is a
@@ -28,26 +28,42 @@ def regression_beta(stock_close: pd.Series, market_close: pd.Series, min_obs: in
     return float(BLUME_WEIGHT * raw + (1 - BLUME_WEIGHT))
 
 
-def compute_betas(symbols: list[str], download=None, chunk: int = 100) -> dict:
-    """{symbol: adjusted beta} for every symbol with enough price history. Never raises."""
+BETA_WEEKS = 105  # 2 years of weekly closes -> 104 weekly returns
+
+
+def market_history(symbols: list[str], download=None, chunk: int = 100) -> tuple[dict, dict]:
+    """One batch download per `chunk` symbols: 6 years of weekly prices with dividends.
+
+    Returns ({symbol: adjusted beta}, {symbol: dividend Series}). Replaces one dividend request
+    per stock with a handful of batch requests. Never raises: missing symbols are just absent."""
     if download is None:
         import yfinance as yf
         download = yf.download
-    betas = {}
+    betas, dividends = {}, {}
     for i in range(0, len(symbols), chunk):
         batch = list(symbols[i:i + chunk])
         try:
-            closes = download(batch + [MARKET], period="2y", interval="1wk",
-                              auto_adjust=True, progress=False)["Close"]
+            data = download(batch + [MARKET], period="6y", interval="1wk",
+                            auto_adjust=True, actions=True, progress=False)
+            closes = data["Close"]
         except Exception:
             continue
+        divs = data["Dividends"] if "Dividends" in data else None
         if MARKET not in closes:
             continue
-        market = closes[MARKET]
+        market = closes[MARKET].iloc[-BETA_WEEKS:]
         for sym in batch:
             if sym not in closes:
                 continue
-            b = regression_beta(closes[sym], market)
+            b = regression_beta(closes[sym].iloc[-BETA_WEEKS:], market)
             if b is not None and np.isfinite(b):
                 betas[sym] = round(b, 4)
-    return betas
+            if divs is not None and sym in divs:
+                d = divs[sym]
+                dividends[sym] = d[d > 0]
+    return betas, dividends
+
+
+def compute_betas(symbols: list[str], download=None, chunk: int = 100) -> dict:
+    """{symbol: adjusted beta} vs NIFTY 50 (2 years of weekly returns)."""
+    return market_history(symbols, download=download, chunk=chunk)[0]

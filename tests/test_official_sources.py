@@ -181,3 +181,45 @@ def test_foreign_statements_without_rate_rejected():
     b["info"]["financialCurrency"] = "USD"
     with pytest.raises(RecordError):
         build_record("ABC.NS", b, MACRO, as_of="2026-11-19")
+
+
+# ---------------------------------------------------------------- one batch download for beta + dividends
+from pipeline.sources import yfinance_source
+from pipeline.sources.beta import market_history
+
+
+def test_market_history_returns_betas_on_last_two_years_and_dividends():
+    rng = np.random.default_rng(2)
+    mkt = rng.normal(0.002, 0.02, 312)  # 6 years of weeks
+    stock = np.concatenate([3.0 * mkt[:208], 0.8 * mkt[208:]])  # beta changed 2 years ago
+    idx = pd.date_range("2020-11-22", periods=312, freq="W")
+    closes = pd.DataFrame({"^NSEI": _prices(mkt).to_numpy(), "AAA.NS": _prices(stock).to_numpy()}, index=idx)
+    divs = pd.DataFrame(0.0, index=closes.index, columns=closes.columns)
+    divs.iloc[100, 1], divs.iloc[200, 1] = 4.0, 5.0
+    seen = {}
+
+    def fake_download(tickers, **kw):
+        seen.update(kw)
+        return {"Close": closes[tickers], "Dividends": divs[tickers]}
+
+    betas, dividends = market_history(["AAA.NS"], download=fake_download)
+    assert seen["actions"] is True and seen["period"] == "6y"
+    assert betas["AAA.NS"] == pytest.approx(0.67 * 0.8 + 0.33, abs=0.02)
+    assert list(dividends["AAA.NS"]) == [4.0, 5.0]
+
+
+def test_fetch_bundle_skips_dividend_request_when_given(monkeypatch):
+    class T:
+        def __init__(self, sym):
+            b = make_bundle()
+            self.info, self.financials = b["info"], b["income"]
+            self.balance_sheet, self.cashflow = b["balance"], b["cashflow"]
+
+        @property
+        def dividends(self):
+            raise AssertionError("per-ticker dividend request should be skipped")
+
+    monkeypatch.setattr(yfinance_source.yf, "Ticker", T)
+    given = pd.Series([1.0], index=pd.to_datetime(["2025-07-01"]))
+    res = yfinance_source.fetch_bundle("ABC.NS", dividends=given)
+    assert res.error is None and res.bundle["dividends"] is given

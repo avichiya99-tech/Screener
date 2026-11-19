@@ -21,7 +21,7 @@ import requests
 from pipeline.build import build_record, statements_currency, summary_row
 from pipeline.config import load_macro
 from pipeline.jsonsafe import to_jsonable
-from pipeline.sources.beta import compute_betas
+from pipeline.sources.beta import market_history
 from pipeline.sources.ccil_rf import live_macro
 from pipeline.sources.fx import fx_rate
 from pipeline.sources.nse_bhavcopy import latest_closes
@@ -140,6 +140,8 @@ def legacy_row(record: dict, bundle: dict) -> dict:
         "Company": record["name"],
         "Sector": record["sector"],
         "Model": record["model"],
+        "Verdict": record["verdict"],
+        "Confidence": record["confidence"],
         "Price": price,
         "Market Cap (Cr)": record["market_cap_cr"],
         "Trailing EPS": round(t_eps, 2) if t_eps else None,
@@ -162,8 +164,9 @@ def legacy_row(record: dict, bundle: dict) -> dict:
     }
 
 
-def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, betas: dict | None = None):
-    res = fetch_bundle(symbol)
+def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, betas: dict | None = None,
+             dividends: dict | None = None):
+    res = fetch_bundle(symbol, dividends=(dividends or {}).get(symbol))
     if res.bundle is None:
         return None, {"symbol": symbol, "error": res.error}
     try:
@@ -234,11 +237,11 @@ def main() -> int:
     closes, close_day = latest_closes(now.astimezone(IST).date())
     price_source = (f"NSE official close ({close_day.isoformat()}); yfinance fallback" if closes
                     else "yfinance (unofficial) - NSE bhavcopy unavailable")
-    betas = compute_betas(targets)
+    betas, dividends = market_history(targets)
     print(f"Prices: {price_source}. Betas vs NIFTY 50 for {len(betas)}/{len(targets)}. "
           f"Valuing {len(targets)} NIFTY 500 stocks...")
 
-    records, legacy, failures, aborted = run_all(targets, lambda s: _process(s, macro, as_of, closes, betas))
+    records, legacy, failures, aborted = run_all(targets, lambda s: _process(s, macro, as_of, closes, betas, dividends))
     if aborted:
         print(f"Stopped after {MAX_CONSECUTIVE_FAILURES} failures in a row (data source blocking?); "
               f"kept previous data. Last error: {failures[-1]['error']}", file=sys.stderr)

@@ -1,5 +1,4 @@
 """Tests for the six deferred minor issues."""
-import json
 import threading
 from datetime import datetime, timezone
 
