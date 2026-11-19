@@ -2,8 +2,9 @@
 streamlit==1.50.0
 yfinance==1.2.0
 pandas==2.3.3
-numpy==2.0.2
+# numpy/scipy are ranges: no single version has wheels for both local Python 3.9 and Streamlit Cloud's 3.13.
+numpy>=2.0.2,<3
 plotly==7.1.0
-scipy==1.13.1
+scipy>=1.13.1,<2
 openpyxl==3.1.5
 requests==2.32.5
