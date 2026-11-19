@@ -26,14 +26,20 @@ def fetch_bundle(symbol: str, retries: int = 3, sleep=time.sleep) -> FetchResult
             t = yf.Ticker(symbol)
             info = t.info or {}
             if info.get("currentPrice") or info.get("regularMarketPrice"):
-                return FetchResult(symbol, {
-                    "info": info,
-                    "income": t.financials,
-                    "balance": t.balance_sheet,
-                    "cashflow": t.cashflow,
-                    "dividends": t.dividends,
-                }, None)
-            last_error = f"no price after {attempts} attempts"
+                income = t.financials
+                # yfinance swallows statement-endpoint errors and returns an empty frame:
+                # treat that as a failed attempt so throttling can't masquerade as success.
+                if income is not None and not income.empty:
+                    return FetchResult(symbol, {
+                        "info": info,
+                        "income": income,
+                        "balance": t.balance_sheet,
+                        "cashflow": t.cashflow,
+                        "dividends": t.dividends,
+                    }, None)
+                last_error = f"no financial statements after {attempts} attempts"
+            else:
+                last_error = f"no price after {attempts} attempts"
         except Exception as exc:  # network errors, Yahoo schema changes, throttling
             last_error = f"{type(exc).__name__}: {exc}"
         if attempt < retries:

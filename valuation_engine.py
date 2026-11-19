@@ -320,6 +320,17 @@ def compute_valuation(
             ni = get_row_value(inc, ["Net Income", "Net Income Common Stockholders"])
             raw_roe = (ni / (bvps * shares)) if (ni and bvps > 0) else None
             roe_source = "estimated"
+        fin_years = 0
+        if inc is not None and not inc.empty:
+            for lbl in ("Net Income", "Net Income Common Stockholders"):
+                if lbl in inc.index:
+                    fin_years = int(pd.to_numeric(inc.loc[lbl], errors="coerce").notna().sum())
+                    break
+        fin_reason = None
+        if raw_roe is not None and raw_roe <= 0:
+            fin_reason = "Loss-making: valuation not meaningful"
+        elif fin_years < 3:
+            fin_reason = "Less than 3 years of history"
         hist_roe, roe_status = _bounded(raw_roe, 0.04, 0.30, 0.14)
         if roe_status == "reported":
             roe_status = roe_source
@@ -371,8 +382,9 @@ def compute_valuation(
             "valid": True,
             "model": "Excess Return (Fin)",
             "is_financial": True,
-            "meaningful": True,
-            "not_meaningful_reason": None,
+            "meaningful": fin_reason is None,
+            "not_meaningful_reason": fin_reason,
+            "history_years": fin_years,
             "sector": sector,
             "currency": info.get("currency", "INR"),
             "price": price,
@@ -533,6 +545,8 @@ SCENARIO_SHIFTS = {
     "bull": {"growth": 0.04, "margin": 1.10, "disc": -0.01, "roe": 0.03},
 }
 
+MIN_DISCOUNT_SPREAD = 0.02  # scenario discount rates stay at least 2pp above terminal growth
+
 KEY_INPUTS = {
     False: ("revenue_growth", "ebit_margin", "tax_rate", "beta", "da_pct", "capex_pct"),
     True: ("roe", "beta", "payout", "bvps"),
@@ -543,19 +557,23 @@ def compute_scenarios(bundle: dict, macro: dict) -> dict:
     """Bear / base / bull per-share values. Values are None when the model can't run."""
     kw = dict(rf=macro["rf"], erp=macro["erp"], terminal_g=macro["terminal_g"], mos_pct=macro["mos_pct"])
     base = compute_valuation(bundle, **kw)
-    out = {"bear": None, "base": None, "bull": None, "base_result": base}
+    out = {"bear": None, "base": None, "bull": None, "base_result": base, "unstable_reason": None}
     if not base.get("valid"):
         return out
     out["base"] = base["intrinsic_price"]
+    min_disc = macro["terminal_g"] + MIN_DISCOUNT_SPREAD
+    if base["discount_rate"] < min_disc:
+        out["unstable_reason"] = "Discount rate too close to long-term growth: value unreliable"
     for name, s in SCENARIO_SHIFTS.items():
+        disc = max(base["discount_rate"] + s["disc"], min_disc)
         if base["is_financial"]:
-            r = compute_valuation(bundle, **kw, driver_override=base["driver"] + s["roe"],
-                                  discount_override=base["discount_rate"] + s["disc"])
+            r = compute_valuation(bundle, **kw, driver_override=base["driver"] + s["roe"], discount_override=disc)
         else:
             r = compute_valuation(bundle, **kw, driver_override=base["driver"] + s["growth"],
-                                  margin_override=base["ebit_margin"] * s["margin"],
-                                  discount_override=base["discount_rate"] + s["disc"])
+                                  margin_override=base["ebit_margin"] * s["margin"], discount_override=disc)
         out[name] = r["intrinsic_price"] if r.get("valid") else None
+    if out["unstable_reason"] is None and (out["bear"] is None or out["bull"] is None or out["bear"] <= 0):
+        out["unstable_reason"] = "Bear-case value is negative: valuation too sensitive to assumptions"
     return out
 
 

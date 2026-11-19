@@ -48,3 +48,6 @@ The run used live yfinance data on 2026-11-19, with the same macro inputs as v1 
    - DMART (negative value; Yahoo's debt likely includes store lease liabilities and capex is high)
 
    These show the limit of yfinance statements. The confidence badge does not catch them, because the inputs are "reported", just not representative. A data cross-check (Plan 2 or a follow-up) should flag stocks whose value is under 20% of price with High confidence for manual review.
+
+## Update after final review fixes
+Re-running the same 20 stocks gives 7 Not rated, 6 Expensive, 5 Fair, 2 Cheap. ADANIGREEN and ADANIENSOL are now Not rated, because their bear-case value is negative and the valuation is too sensitive to assumptions. "Not rated" stocks no longer publish fair values.

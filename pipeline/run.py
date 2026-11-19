@@ -62,11 +62,28 @@ def write_outputs(records: list[dict], failures: list[dict], out_dir: Path, now:
         return False
 
     now_ist = now.astimezone(IST)
-    records = sorted(records, key=lambda r: r.get("market_cap_cr") or 0, reverse=True)
+    fresh_count = len(records)
+    # Carry yesterday's page forward for tickers that failed tonight, flagged as stale,
+    # so a one-night Yahoo hiccup never makes a stock vanish from the site.
+    fresh = {r["symbol"] for r in records}
+    stale = []
+    for f in failures:
+        sym = f["symbol"].replace(".NS", "").replace(".BO", "")
+        prev_path = out_dir / "stocks" / f"{sym}.json"
+        if sym in fresh or not prev_path.exists():
+            continue
+        try:
+            prev = json.loads(prev_path.read_text())
+        except (OSError, ValueError):
+            continue
+        prev["stale_since"] = prev.get("stale_since") or prev.get("as_of")
+        stale.append(prev)
+    records = sorted(list(records) + stale, key=lambda r: r.get("market_cap_cr") or 0, reverse=True)
     summary = [summary_row(r) for r in records]
     meta = {
         "as_of": now_ist.isoformat(timespec="minutes"),
-        "count": len(records),
+        "count": fresh_count,
+        "stale": sorted(r["symbol"] for r in stale),
         "failures": failures,
         "sources": sources or {},
         "macro": macro or {},

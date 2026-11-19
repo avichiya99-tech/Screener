@@ -20,7 +20,7 @@ RECORD_KEYS = (
 
 SUMMARY_KEYS = (
     "symbol", "name", "sector", "price", "market_cap_cr", "verdict", "confidence", "upside_pct",
-    "pe", "dividend_badge", "dividend_yield_pct", "implied_driver", "hist_driver",
+    "pe", "dividend_badge", "dividend_yield_pct", "implied_driver", "hist_driver", "stale_since",
 )
 
 
@@ -48,6 +48,9 @@ def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = Non
     valid = bool(val.get("valid"))
     meaningful = bool(val.get("meaningful")) if valid else False
     reason = val.get("not_meaningful_reason") if valid else val.get("reason")
+    if meaningful and sc.get("unstable_reason"):
+        meaningful, reason = False, sc["unstable_reason"]
+    rated = valid and meaningful  # only rated stocks publish fair values
 
     implied = {"value": None, "status": "invalid"}
     if valid:
@@ -73,9 +76,9 @@ def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = Non
         "confidence": confidence(val.get("inputs", {}), meaningful),
         "meaningful": meaningful,
         "not_meaningful_reason": reason,
-        "scenarios": {k: _r(sc[k]) for k in ("bear", "base", "bull")},
-        "upside_pct": _r(val.get("upside_pct"), 1) if valid else None,
-        "mos_buy_price": _r(val.get("mos_buy_price")) if valid else None,
+        "scenarios": {k: (_r(sc[k]) if rated else None) for k in ("bear", "base", "bull")},
+        "upside_pct": _r(val.get("upside_pct"), 1) if rated else None,
+        "mos_buy_price": _r(val.get("mos_buy_price")) if rated else None,
         "implied_driver": implied,
         "hist_driver": _pct(val.get("hist_driver")) if valid else None,
         "driver_label": val.get("driver_label"),
@@ -98,4 +101,5 @@ def summary_row(record: dict) -> dict:
     flat["dividend_badge"] = record["dividend"]["badge"]
     flat["dividend_yield_pct"] = record["dividend"]["yield_pct"]
     flat["implied_driver"] = record["implied_driver"]["value"]
+    flat.setdefault("stale_since", None)
     return {k: flat[k] for k in SUMMARY_KEYS}
