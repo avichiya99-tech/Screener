@@ -23,6 +23,8 @@ def test_reit_is_not_rated():
     assert rec["scenarios"] == {"bear": None, "base": None, "bull": None}
     assert rec["upside_pct"] is None
     assert "REIT" in rec["not_meaningful_reason"]
+    # The reverse DCF uses the same company model, so it says nothing about a trust either.
+    assert rec["implied_driver"] == {"value": None, "status": "not_applicable"}
 
 
 def test_official_nse_name_replaces_yahoo_name():

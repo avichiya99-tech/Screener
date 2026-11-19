@@ -114,8 +114,8 @@ def build_record(symbol: str, bundle: dict, macro: dict, as_of: str | None = Non
         reason = f"{trust}: valued on distribution yield and NAV, not a company cash-flow model"
     rated = valid and meaningful  # only rated stocks publish fair values
 
-    implied = {"value": None, "status": "invalid"}
-    if valid:
+    implied = {"value": None, "status": "not_applicable" if trust else "invalid"}
+    if valid and not trust:
         rev = solve_reverse_valuation(bundle, val["discount_rate"], terminal_g=macro["terminal_g"])
         implied = {"value": rev["implied"], "status": rev["status"]}
 
