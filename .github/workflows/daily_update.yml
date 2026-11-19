@@ -1,0 +1,49 @@
+name: Daily NIFTY DCF & Dividend Update
+
+on:
+  schedule:
+    # 13:30 UTC = 7:00 PM IST (Mon-Fri). NSE publishes the day's official closing prices
+    # (bhavcopy) in the early evening; running earlier would value on yesterday's close.
+    - cron: "30 13 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A manual run and the scheduled run never overlap (they would collide at git push).
+concurrency:
+  group: daily-update
+  cancel-in-progress: false
+
+jobs:
+  update-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MAX_STOCKS: "0" # 0 = all NIFTY 500 stocks
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run daily valuation pipeline
+        run: python update_data.py
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily NIFTY valuations $(date +'%Y-%m-%d')"
+          git push

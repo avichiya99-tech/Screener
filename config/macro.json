@@ -1,0 +1,8 @@
+{
+  "rf": 0.0728,
+  "erp": 0.055,
+  "terminal_g": 0.05,
+  "mos_pct": 0.25,
+  "updated_on": "2026-11-20",
+  "notes": "rf is fetched live each night from CCIL (10Y central G-sec benchmark). This value is only the fallback if CCIL is unreachable: CCIL 6.94% GS 2036 closed at 7.2752% on 2026-11-19. See docs/data-sources.md."
+}

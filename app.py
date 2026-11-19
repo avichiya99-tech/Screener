@@ -11,7 +11,13 @@ from valuation_engine import (
     compute_dividend_quality,
     build_historical_eps_div_df,
     export_formula_excel,
+    simulate_values,
 )
+from pipeline.build import statements_currency
+from pipeline.config import load_macro
+from pipeline.sources.beta import compute_betas
+from pipeline.sources.ccil_rf import live_macro
+from pipeline.sources.fx import fx_rate
 
 st.set_page_config(page_title="India Valuation & Dividend Workbench", layout="wide")
 
@@ -24,16 +30,33 @@ def load_daily_screener() -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+@st.cache_data(ttl=6 * 3600)
+def official_rf() -> float:
+    """10Y G-sec yield from CCIL (falls back to config/macro.json)."""
+    return live_macro(load_macro())[0]["rf"]
+
+
 @st.cache_data(ttl=3600)
 def fetch_bundle(sym: str) -> dict:
     t = yf.Ticker(sym)
-    return {
+    b = {
         "info": t.info or {},
         "income": t.financials,
         "balance": t.balance_sheet,
         "cashflow": t.cashflow,
         "dividends": t.dividends,
     }
+    if sym.endswith((".NS", ".BO")):
+        # Same as the nightly pipeline: beta vs NIFTY 50, not Yahoo's S&P 500 beta.
+        b["info"] = {**b["info"], "beta": compute_betas([sym]).get(sym)}
+    fin_ccy, quote_ccy = statements_currency(b["info"])
+    rate = fx_rate(fin_ccy, quote_ccy) if fin_ccy != quote_ccy else None
+    if rate:
+        for k in ("income", "balance", "cashflow"):
+            if b[k] is not None:
+                b[k] = b[k] * rate
+        b["info"] = {**b["info"], "financialCurrency": quote_ccy}
+    return b
 
 
 st.title("India's Open Valuation & Dividend Sustainability Workbench")
@@ -50,7 +73,7 @@ if df_all.empty:
     ticker_options = ["TCS.NS", "INFY.NS", "ITC.NS", "RELIANCE.NS", "HDFCBANK.NS", "SBIN.NS", "BAJFINANCE.NS"]
 else:
     last_upd = df_all["Last Updated (IST)"].iloc[0] if "Last Updated (IST)" in df_all.columns else "Recently"
-    st.info(f"Auto-updated weekdays at 4:30 PM IST | Last refresh: **{last_upd}** | Universe: **{len(df_all)} NSE stocks**")
+    st.info(f"Auto-updated weekdays at 7:00 PM IST | Last refresh: **{last_upd}** | Universe: **{len(df_all)} NSE stocks**")
 
     df_work = df_all.copy()
     mos_col = f"MoS Buy Price ({int(mos_pct*100)}%)"
@@ -72,7 +95,7 @@ else:
         filtered_df = filtered_df[filtered_df["Div Class"] == sel_div_cls]
     filtered_df = filtered_df[filtered_df["Dividend Yield (%)"].fillna(0) >= min_yield]
     if only_mos_zone:
-        filtered_df = filtered_df[filtered_df["In MoS Buy Zone"] == True]
+        filtered_df = filtered_df[filtered_df["In MoS Buy Zone"]]
     if only_pos_gap:
         filtered_df = filtered_df[filtered_df["Expectations Gap (%)"].fillna(-999) > 0]
 
@@ -105,7 +128,7 @@ else:
     drop_cols = {"Last Updated (IST)", "MoS Buy Price (25%)"}
     display_cols = [c for c in filtered_df.columns if c not in drop_cols]
     filtered_df = filtered_df.sort_values(by=sort_by, ascending=asc, na_position="last").reset_index(drop=True)
-    st.dataframe(filtered_df[display_cols], use_container_width=True, height=420)
+    st.dataframe(filtered_df[display_cols], width="stretch", height=420)
     ticker_options = filtered_df["Ticker"].tolist() if not filtered_df.empty else df_all["Ticker"].tolist()
 
 # --- Section 2: Live Single-Stock Deep-Dive ---
@@ -122,7 +145,8 @@ active_ticker = custom_ticker if custom_ticker else selected_ticker
 
 st.sidebar.divider()
 st.sidebar.header("2. Deep-Dive Assumptions")
-rf_rate = st.sidebar.slider("Risk-Free Rate (10Y G-Sec %)", 4.0, 10.0, 7.0, 0.1) / 100
+rf_rate = st.sidebar.slider("Risk-Free Rate (10Y G-Sec %, live from CCIL)", 4.0, 10.0,
+                            round(official_rf() * 100, 1), 0.1) / 100
 erp_rate = st.sidebar.slider("Equity Risk Premium (%)", 3.0, 9.0, 5.5, 0.1) / 100
 term_g = st.sidebar.slider("Terminal Growth Rate (%)", 2.0, 7.0, 5.0, 0.25) / 100
 
@@ -134,7 +158,7 @@ if not base_val.get("valid"):
     st.error(f"Cannot run valuation for {active_ticker}: {base_val.get('reason')}")
     st.stop()
 
-driver_name = "Expected 5Y ROE (%)" if base_val["is_financial"] else "5Y Revenue Growth Rate (%)"
+driver_name = "ROE, years 1-5 (%)" if base_val["is_financial"] else "Revenue growth, years 1-5 (%)"
 disc_name = "Cost of Equity Ke (%)" if base_val["is_financial"] else "WACC (%)"
 
 min_drv = 4.0 if base_val["is_financial"] else -5.0
@@ -161,7 +185,7 @@ if not val.get("valid"):
     st.stop()
 
 dq = compute_dividend_quality(bundle, val)
-implied_driver = solve_reverse_valuation(bundle, val["discount_rate"], terminal_g=term_g)
+implied_driver = solve_reverse_valuation(bundle, val["discount_rate"], terminal_g=term_g)["implied"]
 curr = "₹" if val["currency"] == "INR" else f"{val['currency']} "
 
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -186,6 +210,7 @@ if not val["is_financial"]:
 else:
     for c in ["Begin BVPS", "Projected EPS", "Projected DPS", "Excess Return", "PV of Excess Return", "End BVPS"]:
         proj[c] = proj[c].round(2)
+    proj["ROE"] = (proj["ROE"] * 100).round(2)
 
 hist_df = build_historical_eps_div_df(bundle)
 
@@ -198,8 +223,8 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 with tab1:
     unit_note = "(Per-Share Excess Return)" if val["is_financial"] else f"({curr} {'Crores' if val['currency']=='INR' else 'Millions'})"
-    st.markdown(f"**5-Year Forecast {unit_note}**")
-    st.dataframe(proj, use_container_width=True, hide_index=True)
+    st.markdown(f"**{len(proj)}-Year Forecast {unit_note}**")
+    st.dataframe(proj, width="stretch", hide_index=True)
 
     w52_lo, w52_hi = bundle["info"].get("fiftyTwoWeekLow"), bundle["info"].get("fiftyTwoWeekHigh")
     ff_l, ff_lo, ff_hi = [], [], []
@@ -251,30 +276,8 @@ with tab2:
     st.plotly_chart(fig_s, use_container_width=True)
 
 with tab3:
-    rng = np.random.default_rng(42)
-    n = 5000
-    if val["is_financial"]:
-        roes = np.clip(rng.normal(val["driver"], 0.02, n), 0.04, 0.35)
-        kes = np.maximum(rng.normal(val["discount_rate"], 0.01, n), term_g + 0.01)
-        bv = np.full(n, val["bvps"], dtype=float)
-        pv_er = np.zeros(n)
-        for yr in range(1, 6):
-            er = bv * (roes - kes)
-            pv_er += er / ((1 + kes) ** yr)
-            bv = bv + (bv * roes) * (1 - val["payout_ratio_model"])
-        tv_er = (bv * 0.75 * (roes - kes)) / (kes - term_g)
-        sims = val["bvps"] + pv_er + tv_er / ((1 + kes) ** 5)
-    else:
-        rg = rng.normal(val["driver"], 0.03, n)
-        em = np.clip(rng.normal(val["ebit_margin"], 0.02, n), 0.01, 0.65)
-        wa = np.maximum(rng.normal(val["discount_rate"], 0.01, n), term_g + 0.01)
-        pv_tot, crev = np.zeros(n), np.full(n, val["base_revenue"], dtype=float)
-        for yr in range(1, 6):
-            prev = crev
-            crev = prev * (1 + rg)
-            fcff = crev * em * (1 - val["tax_rate"]) + crev * (val["da_pct"] - val["capex_pct"]) - (crev - prev) * val["nwc_pct"]
-            pv_tot += fcff / ((1 + wa) ** yr)
-        sims = (pv_tot + ((fcff * (1 + term_g)) / (wa - term_g)) / ((1 + wa) ** 5) - (val["total_debt"] - val["cash"])) / val["shares"]
+    # Same model as the headline value (10-year fade DCF / 3-stage bank excess return).
+    sims = simulate_values(val, terminal_g=term_g, n=5000, seed=42)
 
     lo, hi = np.percentile(sims, [1, 99])
     sims = sims[(sims >= lo) & (sims <= hi)]
@@ -303,7 +306,7 @@ with tab4:
         fig_h.add_trace(go.Scatter(x=hist_df["Year"], y=hist_df["Payout Ratio (%)"], name="Payout Ratio (%)", mode="lines+markers", line=dict(color="#F58518")), secondary_y=True)
         fig_h.update_layout(barmode="group", height=360)
         st.plotly_chart(fig_h, use_container_width=True)
-        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+        st.dataframe(hist_df, width="stretch", hide_index=True)
 
 st.divider()
 excel_bytes = export_formula_excel(filtered_df, val, hist_df, active_ticker, mos_pct=mos_pct)

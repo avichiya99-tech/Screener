@@ -1,8 +1,9 @@
-streamlit
-yfinance
-pandas
-numpy
-plotly
-scipy
-openpyxl
-requests
+# Pinned: yfinance's data shape and silent-failure behaviour change between versions.
+streamlit==1.50.0
+yfinance==1.2.0
+pandas==2.3.3
+numpy==2.0.2
+plotly==7.1.0
+scipy==1.13.1
+openpyxl==3.1.5
+requests==2.32.5
