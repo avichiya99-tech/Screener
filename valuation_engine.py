@@ -17,6 +17,33 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 FINANCIAL_SECTORS = {"Financial Services", "Banks", "Insurance"}
+ER_PERSISTENCE = 0.7  # share of a bank's excess-return spread that survives each year after Year 5
+
+
+class Inputs:
+    """Records every model input with where it came from: reported, estimated, or default."""
+
+    STATUSES = ("reported", "estimated", "default")
+
+    def __init__(self):
+        self._items: dict[str, dict] = {}
+
+    def set(self, name: str, value, status: str):
+        if status not in self.STATUSES:
+            raise ValueError(f"bad status {status!r}")
+        self._items[name] = {"value": None if value is None else float(value), "status": status}
+        return value
+
+    def as_dict(self) -> dict:
+        return {k: dict(v) for k, v in self._items.items()}
+
+
+def _bounded(raw, lo: float, hi: float, default: float) -> tuple[float, str]:
+    """Clip a raw input. Missing -> (default, 'default'); clipped -> 'estimated'; else 'reported'."""
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return float(default), "default"
+    val = float(np.clip(raw, lo, hi))
+    return val, ("reported" if val == float(raw) else "estimated")
 
 
 def get_row_value(df: pd.DataFrame | None, labels: list[str], default: float = 0.0) -> float:
@@ -259,7 +286,9 @@ def compute_valuation(
     if not all([price, shares, mcap]) or price <= 0 or shares <= 0:
         return {"valid": False, "is_financial": is_fin, "reason": "Missing price or shares data"}
 
-    beta = float(np.clip(info.get("beta") or 1.0, 0.4, 2.2))
+    inputs = Inputs()
+    beta, beta_status = _bounded(info.get("beta"), 0.4, 2.2, 1.0)
+    inputs.set("beta", beta, beta_status)
     ke = rf + beta * erp
 
     # =====================================================================
@@ -267,22 +296,32 @@ def compute_valuation(
     # =====================================================================
     if is_fin:
         bvps = info.get("bookValue")
+        bvps_status = "reported"
         if not bvps or bvps <= 0:
             eq = get_row_value(bal, ["Stockholders Equity", "Total Equity Gross Minority Interest", "Common Stock Equity"])
             bvps = (eq / shares) if eq > 0 else 0.0
+            bvps_status = "estimated"
         if bvps <= 0:
             return {"valid": False, "is_financial": True, "sector": sector, "reason": "Missing positive Book Value per Share"}
+        inputs.set("bvps", bvps, bvps_status)
 
         raw_roe = info.get("returnOnEquity")
+        roe_source = "reported"
         if raw_roe is None:
             ni = get_row_value(inc, ["Net Income", "Net Income Common Stockholders"])
-            raw_roe = (ni / (bvps * shares)) if (ni and bvps > 0) else 0.14
-        hist_roe = float(np.clip(raw_roe, 0.04, 0.30))
+            raw_roe = (ni / (bvps * shares)) if (ni and bvps > 0) else None
+            roe_source = "estimated"
+        hist_roe, roe_status = _bounded(raw_roe, 0.04, 0.30, 0.14)
+        if roe_status == "reported":
+            roe_status = roe_source
+        inputs.set("roe", hist_roe, roe_status)
         roe = driver_override if driver_override is not None else hist_roe
 
         dps = info.get("dividendRate") or 0.0
         t_eps = info.get("trailingEps") or (bvps * hist_roe)
-        payout = float(np.clip(dps / t_eps, 0.0, 0.70)) if (t_eps and t_eps > 0 and dps > 0) else 0.15
+        raw_payout = (dps / t_eps) if (t_eps and t_eps > 0 and dps > 0) else None
+        payout, payout_status = _bounded(raw_payout, 0.0, 0.70, 0.15)
+        inputs.set("payout", payout, payout_status)
 
         disc = discount_override if discount_override is not None else ke
         if disc <= terminal_g:
@@ -309,9 +348,10 @@ def compute_valuation(
             })
             curr_bv = end_bv
 
-        # Terminal Excess Return retains 75% of excess ROE spread (25% fade after Yr 5)
-        term_er = curr_bv * (0.75 * (roe - disc))
-        tv_er = term_er / (disc - terminal_g)
+        # Terminal: the excess-return spread fades by ER_PERSISTENCE each year after Year 5
+        # (Ohlson persistence), instead of earning a fixed share of it forever.
+        term_er = curr_bv * (roe - disc)
+        tv_er = term_er / (1 + disc - ER_PERSISTENCE)
         pv_tv_er = tv_er / ((1 + disc) ** 5)
 
         intrinsic = bvps + pv_er_total + pv_tv_er
@@ -336,6 +376,8 @@ def compute_valuation(
             "pv_er_total": pv_er_total,
             "tv_er": tv_er,
             "pv_tv_er": pv_tv_er,
+            "terminal_method": f"persistence_{ER_PERSISTENCE}",
+            "inputs": inputs.as_dict(),
             "intrinsic_price": intrinsic,
             "mos_buy_price": mos_buy,
             "upside_pct": upside,
@@ -367,12 +409,16 @@ def compute_valuation(
     cash = get_row_value(bal, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"])
 
     ebitda_ttm = ebit + da if ebit > 0 else get_row_value(inc, ["EBITDA"])
-    tax = float(np.clip((tax_p / pretax) if pretax > 0 else 0.25, 0.15, 0.35))
+    tax, tax_status = _bounded((tax_p / pretax) if (pretax > 0 and tax_p) else None, 0.15, 0.35, 0.25)
+    inputs.set("tax_rate", tax, tax_status)
     hist_cagr = get_historical_cagr(inc, ["Total Revenue", "Operating Revenue"], default=0.08)
     rev_g = driver_override if driver_override is not None else hist_cagr
-    ebit_m = float(np.clip(ebit / rev, 0.02, 0.50)) if ebit > 0 else 0.12
-    da_p = float(np.clip(da / rev, 0.01, 0.15))
-    capex_p = float(np.clip(capex / rev, 0.01, 0.20))
+    ebit_m, ebit_status = _bounded((ebit / rev) if ebit > 0 else None, 0.02, 0.50, 0.12)
+    inputs.set("ebit_margin", ebit_m, ebit_status)
+    da_p, da_status = _bounded((da / rev) if da > 0 else None, 0.01, 0.15, 0.03)
+    inputs.set("da_pct", da_p, da_status)
+    capex_p, capex_status = _bounded((capex / rev) if capex > 0 else None, 0.01, 0.20, 0.05)
+    inputs.set("capex_pct", capex_p, capex_status)
     nwc_p = 0.01
 
     kd = float(np.clip((interest / debt) if debt > 0 else (rf + 0.015), rf, rf + 0.06)) * (1 - tax)
@@ -445,6 +491,7 @@ def compute_valuation(
         "fcf_ttm": fcf_ttm,
         "dividends_paid": divs_paid,
         "ebitda_ttm": ebitda_ttm,
+        "inputs": inputs.as_dict(),
         "intrinsic_price": intrinsic,
         "mos_buy_price": mos_buy,
         "upside_pct": upside,
@@ -700,7 +747,7 @@ def export_formula_excel(
         bridge = [
             (24, "Beginning Book Value / Share", "=$B$5", "#,##0.00", False),
             (25, "PV of Explicit Excess Returns (Yr 1-5)", "=SUM(B20:F20)", "#,##0.00", False),
-            (26, "Terminal Excess Return Value (25% Fade)", "=(F21*(0.75*($B$6-$B$8)))/($B$8-$B$9)", "#,##0.00", False),
+            (26, f"Terminal Excess Return Value (fades {ER_PERSISTENCE:.0%}/yr)", f"=(F21*($B$6-$B$8))/(1+$B$8-{ER_PERSISTENCE})", "#,##0.00", False),
             (27, "PV of Terminal Excess Return", "=B26/((1+$B$8)^5)", "#,##0.00", False),
             (28, "Intrinsic Share Price", "=B24+B25+B27", "#,##0.00", True),
             (29, "Current Market Price", "=$B$10", "#,##0.00", False),
