@@ -23,6 +23,7 @@ import requests
 from pipeline.build import build_record, statements_currency, summary_row
 from pipeline.config import load_macro
 from pipeline.jsonsafe import to_jsonable
+from pipeline.snapshot import valuation_bundle, write_snapshots
 from pipeline.sources.beta import market_history
 from pipeline.sources.ccil_rf import live_macro
 from pipeline.sources.fx import fx_rate
@@ -198,7 +199,7 @@ def legacy_row(record: dict, bundle: dict) -> dict:
 
 
 def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, betas: dict | None = None,
-             dividends: dict | None = None, listing: dict | None = None):
+             dividends: dict | None = None, listing: dict | None = None, snapshots: dict | None = None):
     res = fetch_bundle(symbol, dividends=(dividends or {}).get(symbol))
     if res.bundle is None:
         return None, {"symbol": symbol, "error": res.error}
@@ -209,8 +210,11 @@ def _process(symbol: str, macro: dict, as_of: str, closes: dict | None = None, b
             bundle = {**bundle, "info": {**bundle["info"], "beta": betas.get(symbol)}}
         fin_ccy, quote_ccy = statements_currency(bundle["info"])
         official = (closes or {}).get(symbol.replace(".NS", ""))
+        rate = fx_rate(fin_ccy, quote_ccy)
         rec = build_record(symbol, bundle, macro, as_of=as_of, official_price=official,
-                           fx_rate=fx_rate(fin_ccy, quote_ccy), listing=(listing or {}).get(symbol))
+                           fx_rate=rate, listing=(listing or {}).get(symbol))
+        if snapshots is not None:  # what the app values this stock on, without calling Yahoo
+            snapshots[rec["symbol"]] = valuation_bundle(bundle, rec["price"], rate)
         return (rec, legacy_row(rec, bundle)), None
     except Exception as exc:  # one bad ticker never stops the run
         return None, {"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
@@ -299,8 +303,9 @@ def main() -> int:
     print(f"Prices: {price_source}. Betas vs NIFTY 50 for {len(betas)}/{len(targets)}. "
           f"Valuing {len(targets)} NIFTY 500 stocks...")
 
+    snapshots = {}
     process = partial(_process, macro=macro, as_of=as_of, closes=closes, betas=betas, dividends=dividends,
-                      listing=listing)
+                      listing=listing, snapshots=snapshots)
     records, legacy, failures, aborted = run_all(targets, process)
     if aborted:
         print(f"Stopped after {MAX_CONSECUTIVE_FAILURES} failures in a row (data source blocking?); "
@@ -323,6 +328,7 @@ def main() -> int:
     df = pd.DataFrame(legacy).sort_values("Market Cap (Cr)", ascending=False)
     df["Last Updated (IST)"] = now.astimezone(IST).strftime("%d-%b-%Y %I:%M %p IST")
     df.to_csv(DATA_DIR / "daily_screener.csv", index=False)
+    write_snapshots(snapshots, DATA_DIR)
     print(f"Wrote {len(records)} stocks; {len(failures)} failures logged in data/meta.json")
     return 0
 

@@ -15,6 +15,7 @@ from valuation_engine import (
 )
 from pipeline.build import statements_currency
 from pipeline.config import load_macro
+from pipeline.snapshot import get_bundle
 from pipeline.sources.beta import compute_betas
 from pipeline.sources.ccil_rf import live_macro
 from pipeline.sources.fx import fx_rate
@@ -36,8 +37,8 @@ def official_rf() -> float:
     return live_macro(load_macro())[0]["rf"]
 
 
-@st.cache_data(ttl=3600)
-def fetch_bundle(sym: str) -> dict:
+def fetch_live_bundle(sym: str) -> dict:
+    """Live Yahoo fetch, only for tickers outside the NIFTY 500 snapshot."""
     t = yf.Ticker(sym)
     b = {
         "info": t.info or {},
@@ -57,6 +58,12 @@ def fetch_bundle(sym: str) -> dict:
                 b[k] = b[k] * rate
         b["info"] = {**b["info"], "financialCurrency": quote_ccy}
     return b
+
+
+@st.cache_data(ttl=1800)
+def fetch_bundle(sym: str):
+    """(bundle, source, error): last night's snapshot for NIFTY 500 stocks, else live Yahoo."""
+    return get_bundle(sym, "data", fetch_live_bundle)
 
 
 st.title("India's Open Valuation & Dividend Sustainability Workbench")
@@ -151,8 +158,13 @@ erp_rate = st.sidebar.slider("Equity Risk Premium (%)", 3.0, 9.0, 5.5, 0.1) / 10
 term_g = st.sidebar.slider("Terminal Growth Rate (%)", 2.0, 7.0, 5.0, 0.25) / 100
 
 with st.spinner(f"Running live valuation engine for {active_ticker}..."):
-    bundle = fetch_bundle(active_ticker)
-    base_val = compute_valuation(bundle, rf=rf_rate, erp=erp_rate, terminal_g=term_g, mos_pct=mos_pct)
+    bundle, data_source, fetch_error = fetch_bundle(active_ticker)
+if fetch_error:
+    fetch_bundle.clear()  # don't cache a rate-limit failure for half an hour
+    st.warning(fetch_error)
+    st.stop()
+st.caption(f"Data: {data_source}")
+base_val = compute_valuation(bundle, rf=rf_rate, erp=erp_rate, terminal_g=term_g, mos_pct=mos_pct)
 
 if not base_val.get("valid"):
     st.error(f"Cannot run valuation for {active_ticker}: {base_val.get('reason')}")
