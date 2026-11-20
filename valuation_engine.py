@@ -29,6 +29,9 @@ MAX_TERMINAL_SPREAD = 0.05
 
 # Cyclicals: value on through-the-cycle (average) margins; refuse to rate when margins swing too much.
 CYCLICAL_MARGIN_STDEV_MAX = 0.05  # 5 percentage points
+# A few years of cyclical revenue growth is mostly commodity prices, not a trend. Cap the growth
+# carried forward at roughly India's long-run nominal GDP growth.
+CYCLICAL_GROWTH_CAP = 0.10
 
 
 class Inputs:
@@ -490,8 +493,11 @@ def compute_valuation(
     tax, tax_status = _bounded((tax_p / pretax) if (pretax > 0 and tax_p) else None, 0.15, 0.35, 0.25)
     inputs.set("tax_rate", tax, tax_status)
     hist_cagr, rev_years, growth_status = historical_growth(inc, ["Total Revenue", "Operating Revenue"], default=0.08)
-    inputs.set("revenue_growth", hist_cagr, growth_status)
-    rev_g = driver_override if driver_override is not None else hist_cagr
+    growth = hist_cagr
+    if sector in CYCLICAL_SECTORS and hist_cagr > CYCLICAL_GROWTH_CAP:
+        growth, growth_status = CYCLICAL_GROWTH_CAP, "estimated"
+    inputs.set("revenue_growth", growth, growth_status)
+    rev_g = driver_override if driver_override is not None else growth
 
     not_meaningful_reason = None
     if ebit <= 0:

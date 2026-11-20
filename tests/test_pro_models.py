@@ -4,6 +4,7 @@ import pytest
 
 from conftest import make_bank_bundle, make_bundle
 from valuation_engine import (
+    CYCLICAL_GROWTH_CAP,
     MAX_TERMINAL_SPREAD,
     TERMINAL_SPREAD_SHARE,
     compute_valuation,
@@ -86,6 +87,21 @@ def test_cyclical_with_loss_year_not_rated():
                                       revenue=(1200, 1100, 1000, 900), ebit=(180, 165, -10, 135)))
     assert r["meaningful"] is False
     assert "Cyclical" in r["not_meaningful_reason"]
+
+
+def test_cyclical_boom_growth_is_not_extrapolated():
+    # NMDC-like: iron-ore upcycle lifts revenue ~20%/yr for 3 years. That is price, not a
+    # growth trend, so the model must not carry it forward for 5 years.
+    r = compute_valuation(make_bundle(sector="Basic Materials",
+                                      revenue=(1730, 1440, 1200, 1000), ebit=(660, 550, 455, 380)))
+    assert r["hist_driver"] == pytest.approx(0.2, abs=0.01)  # history still shown as it was
+    assert r["driver"] == pytest.approx(CYCLICAL_GROWTH_CAP)
+    assert r["inputs"]["revenue_growth"] == {"value": CYCLICAL_GROWTH_CAP, "status": "estimated"}
+
+
+def test_non_cyclical_growth_is_not_capped_at_cyclical_cap():
+    r = compute_valuation(make_bundle(revenue=(1730, 1440, 1200, 1000), ebit=(260, 216, 180, 150)))
+    assert r["driver"] == pytest.approx(0.2, abs=0.01)
 
 
 def test_non_cyclical_uses_latest_margin():
